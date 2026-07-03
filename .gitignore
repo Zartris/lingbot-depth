@@ -7,3 +7,10 @@ __pycache__
 workspace*/
 result*/
 ckpt/
+
+# distillation harness outputs
+distill/.cache/
+distill/runs/*/
+# keep the aggregate result log + the teacher baseline, ignore per-run checkpoints
+!distill/runs/results.csv
+!distill/runs/teacher_baseline.json

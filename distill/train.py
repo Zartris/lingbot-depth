@@ -1,0 +1,255 @@
+"""
+train.py  —  THE MUTABLE FILE.  This is the only model/training file the research
+agent is allowed to rewrite (see distill/program.md for the rules).
+
+Goal: distill the frozen teacher (LingBot-Depth ViT-L) into a student that is much
+faster on our GPU while staying within the accuracy band defined in prepare.py.
+
+What you (the agent) may change here, freely:
+  * STUDENT_CONFIG / build_student() — backbone size, intermediate_layers,
+    num_tokens_range, neck & head widths, or an entirely custom student module
+    (token merging/pruning, lightweight decoder, ...).
+  * The distillation recipe — which losses (output / feature / gt), their weights,
+    optimizer, LR schedule, augmentations, batch size, steps.
+  * Anything else in THIS file.
+
+What you may NOT change:
+  * distill/prepare.py (data, teacher, metrics, latency, objective) — frozen.
+  * the mdm/ package (defines the frozen teacher) — frozen.
+  * The contract: whatever build_student() returns MUST expose
+        infer(image, depth_in=..., intrinsics=...) -> {"depth", "points", "mask"}
+    with the same tensor shapes as the teacher, so prepare.evaluate() can score it.
+
+Run one experiment with:   python distill/run.py            (train + eval + log)
+This file's `main()` does the training and writes runs/<id>/student.pt.
+"""
+from __future__ import annotations
+
+import sys
+import time
+from pathlib import Path
+from typing import Dict
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+# Make `distill` importable whether launched via `-m distill.run`, `distill/train.py`,
+# or imported by run.py.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from distill import prepare  # noqa: E402
+from distill.prepare import (  # noqa: E402
+    device, load_teacher, derive_student_config, get_datasets, Sample,
+)
+
+# --------------------------------------------------------------------------- #
+#  Experiment knobs  (the agent edits these)                                   #
+# --------------------------------------------------------------------------- #
+
+# --- student architecture --------------------------------------------------- #
+STUDENT_BACKBONE = "dinov2_vits14"     # vits14 (fastest) | vitb14 | vitl14
+STUDENT_NUM_TOKENS_RANGE = [900, 2400]  # fewer tokens than teacher [1200,3600] -> faster
+
+# --- distillation recipe ---------------------------------------------------- #
+W_OUTPUT_DISTILL = 1.0     # match teacher refined depth (log space)
+W_FEATURE_DISTILL = 1.0    # match teacher encoder features (same dim -> no projector)
+W_GT = 0.5                 # supervise on real ground-truth depth where available
+FEATURE_TOKENS = 1200      # token grid used during training (speed vs fidelity)
+
+# --- optimisation ----------------------------------------------------------- #
+LR = 2e-4
+WEIGHT_DECAY = 0.05
+BATCH_SIZE = 2
+WARM_START_DECODER = True  # copy teacher neck/heads into the student (big head start)
+
+# --- budget (this is the "5-minute" knob from autoresearch) ----------------- #
+TRAIN_MINUTES = 20.0       # proxy-run wall-clock budget; promote winners to longer runs
+MAX_STEPS = 100_000        # hard cap
+
+# --- data ------------------------------------------------------------------- #
+USE_HF = False             # False -> local ./examples smoke test (no download / no gt)
+N_TRAIN_REAL = 4000
+N_TRAIN_SIM = 1500
+N_EVAL_REAL = 200
+N_EVAL_SIM = 100
+
+
+# --------------------------------------------------------------------------- #
+#  Student                                                                      #
+# --------------------------------------------------------------------------- #
+
+def build_student() -> torch.nn.Module:
+    """Instantiate the student and warm-start it.
+
+    Encoder: stock DINOv2 (small) pretrained weights via init_weights() (strict=False,
+    so the depth-fusion patch embed inits fresh).  Decoder: optionally copied from the
+    teacher (same config downstream of the encoder), which transfers most of the
+    refinement behaviour for free — the encoder is the main thing distillation teaches.
+    """
+    from mdm.model.v2 import MDMModel
+
+    cfg = derive_student_config(
+        backbone=STUDENT_BACKBONE,
+        num_tokens_range=STUDENT_NUM_TOKENS_RANGE,
+    )
+    student = MDMModel(**cfg).to(device())
+    student.init_weights()  # warm-start encoder from stock DINOv2
+
+    if WARM_START_DECODER:
+        teacher = load_teacher()
+        _copy_matching(teacher, student, prefixes=("neck.", "depth_head.", "mask_head.", "scale_head."))
+    return student
+
+
+def _copy_matching(src: torch.nn.Module, dst: torch.nn.Module, prefixes) -> int:
+    """Copy tensors from src->dst where name-prefixed and shapes match. Returns count."""
+    ssd, dsd = src.state_dict(), dst.state_dict()
+    n = 0
+    for k, v in dsd.items():
+        if k in ssd and ssd[k].shape == v.shape and any(k.startswith(p) for p in prefixes):
+            dsd[k] = ssd[k].clone()
+            n += 1
+    dst.load_state_dict(dsd, strict=False)
+    return n
+
+
+# --------------------------------------------------------------------------- #
+#  Batch prep                                                                   #
+# --------------------------------------------------------------------------- #
+
+def _to_batch(samples, dev):
+    """Stack a list of Samples into padded tensors at a common size (resize to first)."""
+    H, W = samples[0].rgb.shape[:2]
+    imgs, raws, Ks = [], [], []
+    for s in samples:
+        import cv2
+        rgb = cv2.resize(s.rgb, (W, H)) if s.rgb.shape[:2] != (H, W) else s.rgb
+        raw = cv2.resize(s.raw_depth, (W, H), interpolation=cv2.INTER_NEAREST) \
+            if s.raw_depth.shape[:2] != (H, W) else s.raw_depth
+        imgs.append(torch.tensor(rgb / 255.0, dtype=torch.float32).permute(2, 0, 1))
+        raws.append(torch.tensor(raw, dtype=torch.float32))
+        K = s.intrinsics.copy().astype(np.float32); K[0] /= W; K[1] /= H
+        Ks.append(torch.tensor(K))
+    return (torch.stack(imgs).to(dev), torch.stack(raws).to(dev), torch.stack(Ks).to(dev),
+            samples)
+
+
+# --------------------------------------------------------------------------- #
+#  Losses                                                                       #
+# --------------------------------------------------------------------------- #
+
+def _log_l1(pred, target, valid):
+    """L1 in log-depth space on valid pixels (scale-robust, matches remap_depth_out)."""
+    if valid.sum() == 0:
+        return pred.new_zeros(())
+    p = torch.log(pred.clamp_min(1e-3))
+    t = torch.log(target.clamp_min(1e-3))
+    return (F.l1_loss(p, t, reduction="none") * valid).sum() / valid.sum().clamp_min(1)
+
+
+def distill_step(student, teacher, batch, dev) -> Dict[str, torch.Tensor]:
+    imgs, raws, Ks, samples = batch
+    B = imgs.shape[0]
+
+    # Teacher targets (no grad). In a full run these are precomputed & cached by
+    # prepare.cache_teacher_targets(); here we compute inline for simplicity.
+    with torch.no_grad():
+        t_feat, t_cls = teacher.infer_feat(imgs, depth_in=raws, num_tokens=FEATURE_TOKENS)
+        t_out = teacher.infer(imgs, depth_in=raws, intrinsics=Ks, apply_mask=False)
+        t_depth = t_out["depth"]
+
+    # Student forward (with grad). Feature + output heads.
+    with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=(dev.type == "cuda")):
+        s_feat, s_cls = student.forward_feat(imgs, num_tokens=FEATURE_TOKENS, depth=raws)
+        s_out = student.forward(imgs, num_tokens=FEATURE_TOKENS, depth=raws)
+    s_depth = s_out["depth_reg"]
+
+    losses: Dict[str, torch.Tensor] = {}
+
+    # Feature distillation — student & teacher encoder features share dim_out, so we
+    # match them directly (cosine + L2). This is the main lever for keeping accuracy.
+    if W_FEATURE_DISTILL > 0:
+        sf, tf = s_feat.float(), t_feat.float()
+        if sf.shape[-2:] != tf.shape[-2:]:
+            sf = F.interpolate(sf, tf.shape[-2:], mode="bilinear", align_corners=False)
+        cos = 1 - F.cosine_similarity(sf, tf, dim=1).mean()
+        losses["feat"] = W_FEATURE_DISTILL * (cos + 0.1 * F.mse_loss(sf, tf))
+
+    # Output distillation — match the teacher's refined depth.
+    if W_OUTPUT_DISTILL > 0:
+        valid = (t_depth > prepare.MIN_DEPTH) & (t_depth < prepare.MAX_DEPTH) & torch.isfinite(t_depth)
+        losses["out"] = W_OUTPUT_DISTILL * _log_l1(s_depth.float(), t_depth.float(), valid.float())
+
+    # Ground-truth supervision — only where real gt is present.
+    if W_GT > 0:
+        gts = [s.gt_depth for s in samples]
+        if any(g is not None for g in gts):
+            import cv2
+            H, W = imgs.shape[-2:]
+            g_stack, m_stack = [], []
+            for g in gts:
+                if g is None:
+                    g_stack.append(np.zeros((H, W), np.float32)); m_stack.append(np.zeros((H, W), np.float32))
+                else:
+                    gg = cv2.resize(g, (W, H), interpolation=cv2.INTER_NEAREST)
+                    g_stack.append(gg); m_stack.append((gg > prepare.MIN_DEPTH).astype(np.float32))
+            gt = torch.tensor(np.stack(g_stack), device=dev)
+            mask = torch.tensor(np.stack(m_stack), device=dev)
+            if mask.sum() > 0:
+                losses["gt"] = W_GT * _log_l1(s_depth.float(), gt, mask)
+
+    losses["total"] = sum(losses.values()) if losses else s_depth.new_zeros(())
+    return losses
+
+
+# --------------------------------------------------------------------------- #
+#  Train                                                                        #
+# --------------------------------------------------------------------------- #
+
+def main(run_dir: Path) -> Path:
+    torch.manual_seed(prepare.SEED)
+    dev = device()
+    print(f"[train] device={dev} backbone={STUDENT_BACKBONE} tokens={STUDENT_NUM_TOKENS_RANGE}")
+
+    teacher = load_teacher()
+    student = build_student()
+    student.train()
+
+    train_set, _ = get_datasets(N_TRAIN_REAL, N_TRAIN_SIM, use_hf=USE_HF)
+    n = len(train_set)
+    print(f"[train] {n} training samples ({'HF stream' if USE_HF else 'local examples'})")
+
+    opt = torch.optim.AdamW(
+        [p for p in student.parameters() if p.requires_grad], lr=LR, weight_decay=WEIGHT_DECAY)
+
+    rng = np.random.default_rng(prepare.SEED)
+    t_start = time.time()
+    step = 0
+    while (time.time() - t_start) < TRAIN_MINUTES * 60 and step < MAX_STEPS:
+        idx = rng.integers(0, n, size=BATCH_SIZE)
+        batch = _to_batch([train_set[int(i)] for i in idx], dev)
+        losses = distill_step(student, teacher, batch, dev)
+        opt.zero_grad(set_to_none=True)
+        losses["total"].backward()
+        torch.nn.utils.clip_grad_norm_([p for p in student.parameters() if p.requires_grad], 1.0)
+        opt.step()
+        if step % 20 == 0:
+            msg = " ".join(f"{k}={v.item():.4f}" for k, v in losses.items())
+            print(f"[train] step {step:5d} t={time.time()-t_start:6.1f}s {msg}")
+        step += 1
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = run_dir / "student.pt"
+    torch.save({
+        "model": student.state_dict(),
+        "student_backbone": STUDENT_BACKBONE,
+        "num_tokens_range": STUDENT_NUM_TOKENS_RANGE,
+        "steps": step,
+    }, ckpt_path)
+    print(f"[train] done: {step} steps, saved {ckpt_path}")
+    return ckpt_path
+
+
+if __name__ == "__main__":
+    main(prepare.RUNS_DIR / "manual")
