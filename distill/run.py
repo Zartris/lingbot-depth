@@ -35,23 +35,45 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from distill import prepare  # noqa: E402
 
 
-def _load_student(ckpt_path: Path):
-    """Rebuild a student from a saved checkpoint using the MUTABLE student model stack.
+def _student_class_from_snapshot(ckpt_path: Path, snap: str):
+    """Import the student's MDMModel class from the per-checkpoint CODE SNAPSHOT next to
+    it, so we rebuild the exact architecture that was trained — independent of whatever
+    the live distill/student_model/ code looks like now."""
+    import importlib
+    parent = str(Path(ckpt_path).resolve().parent)
+    if parent not in sys.path:
+        sys.path.insert(0, parent)
+    for m in list(sys.modules):            # ensure a clean import of this snapshot
+        if m == snap or m.startswith(snap + "."):
+            del sys.modules[m]
+    return importlib.import_module(f"{snap}.v2").MDMModel
 
-    Uses the config stored in the checkpoint (falls back to re-deriving it). NB: the
-    reconstruction uses the CURRENT distill/student_model/ code — a checkpoint saved
-    under a since-changed student architecture may not load cleanly; that's expected
-    (compare against the best student before editing the student net, or re-run it)."""
+
+def _load_student(ckpt_path: Path):
+    """Rebuild a student from a checkpoint, using the code snapshot saved with it so the
+    exact trained architecture is reconstructed regardless of later edits to the live
+    student code. Falls back to the live stack for old (pre-snapshot) checkpoints."""
     import torch
-    from distill.student_model.v2 import MDMModel as StudentMDMModel
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = ckpt.get("student_config") or prepare.derive_student_config(
         backbone=ckpt["student_backbone"],
         num_tokens_range=ckpt.get("num_tokens_range"),
     )
+    snap = ckpt.get("snapshot_pkg")
+    if snap and (Path(ckpt_path).resolve().parent / snap).exists():
+        StudentMDMModel = _student_class_from_snapshot(ckpt_path, snap)
+    else:
+        if snap:
+            print(f"[run] WARNING: code snapshot '{snap}' missing next to {ckpt_path}; "
+                  "falling back to live student code (may mis-load if it changed).")
+        from distill.student_model.v2 import MDMModel as StudentMDMModel
+
     model = StudentMDMModel(**cfg).to(prepare.device())
-    model.load_state_dict(ckpt["model"], strict=False)
+    missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+    if missing or unexpected:
+        print(f"[run] WARNING: loading {ckpt_path}: {len(missing)} missing / "
+              f"{len(unexpected)} unexpected keys — checkpoint/code may be out of sync.")
     return model.eval()
 
 

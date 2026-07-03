@@ -284,16 +284,35 @@ def main(run_dir: Path, use_hf: bool = False) -> Path:
         step += 1
 
     run_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_pkg = _snapshot_student_code(run_dir)   # freeze the student CODE with the weights
     ckpt_path = run_dir / "student.pt"
     torch.save({
         "model": student.state_dict(),
         "student_config": student_cfg,          # rebuild exactly, without re-deriving
+        "snapshot_pkg": snapshot_pkg,           # the code that defines this architecture
         "student_backbone": STUDENT_BACKBONE,
         "num_tokens_range": STUDENT_NUM_TOKENS_RANGE,
         "steps": step,
     }, ckpt_path)
-    print(f"[train] done: {step} steps, saved {ckpt_path}")
+    print(f"[train] done: {step} steps, saved {ckpt_path} (+ code snapshot {snapshot_pkg}/)")
     return ckpt_path
+
+
+def _snapshot_student_code(run_dir: Path) -> str:
+    """Copy the current distill/student_model/ source next to the checkpoint, so this
+    student's exact architecture can be rebuilt later even after the live student code
+    changes. Returns the snapshot's package name (a valid importable identifier).
+
+    A checkpoint stores weights + config but NOT the code that defines the architecture;
+    since that code is mutable, the snapshot is what makes a past student reproducible."""
+    import shutil
+    snap_name = "student_snap_" + "".join(c if c.isalnum() else "_" for c in run_dir.name)
+    dest = run_dir / snap_name
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.copytree(prepare.REPO_ROOT / "distill" / "student_model", dest,
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    return snap_name
 
 
 if __name__ == "__main__":

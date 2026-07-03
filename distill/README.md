@@ -12,7 +12,7 @@ agent loop in the style of [karpathy/autoresearch](https://github.com/karpathy/a
 | `train.py` | **agent edits this** | Student config + distillation recipe + training loop. |
 | `run.py` | runner | `train → eval → log → keep/revert`. |
 | `program.md` | steering | The agent's rules, the metric, the idea backlog. |
-| `runs/` | output | Per-experiment checkpoints, `results.csv`, `teacher_baseline.json`. |
+| `runs/` | output | Per-experiment `student.pt` + a copy of the student **code snapshot** (so a past student rebuilds exactly even after the live code changes), plus `results.csv`, `teacher_baseline.json`. |
 | `.cache/` | output | Downloaded dataset frames + cached teacher targets. |
 
 ## The metric (one number, lower is better)
