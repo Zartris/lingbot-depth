@@ -64,6 +64,14 @@ python -m distill.run --setup-baseline   # ONCE: measure the teacher (anchors th
 #   4. read the printed score; keep going
 ```
 
+Teacher targets (encoder features + best-quality depth) are cached per sample in
+`.cache/teacher_targets/`, so the ViT-L teacher runs once per `(sample, FEATURE_TOKENS)`
+rather than every step — this is what makes the loop fast. Two consequences: (1) training
+runs at a fixed canvas (`prepare.TRAIN_HW`) so the cache is sound; (2) input augmentation
+would desync the student input from the cached (clean-input) teacher targets — prefer
+RGB-only appearance jitter that leaves geometry intact, or disable the cache, if you
+augment. Changing `FEATURE_TOKENS` just starts a new cache namespace.
+
 Proxy runs are short (`TRAIN_MINUTES≈20`) so you can rank ideas fast. When a config
 clearly wins, a **human** promotes it to a longer run by editing the frozen budget in
 `prepare.py` (raise `TRAIN_MINUTES`, enlarge the data subset) — the agent never does

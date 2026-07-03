@@ -100,6 +100,19 @@ N_EVAL_SIM = 100
 TRAIN_MINUTES = 20.0          # proxy-run wall-clock; humans promote winners to longer runs
 MAX_STEPS = 100_000           # hard cap
 
+# ---- Teacher-target cache ----------------------------------------------------
+# The ViT-L teacher is expensive; caching its per-sample outputs turns the inner loop
+# from "run the teacher every step" into "read a tensor". Caching is only sound if each
+# sample is always processed at the same resolution, so TRAINING uses a fixed canvas
+# (eval still runs at native resolution). Pick a canvas near your data's aspect ratio.
+TRAIN_HW = (480, 640)                 # fixed training resolution (H, W)
+TARGET_CACHE_DIR = CACHE_DIR / "teacher_targets"
+CACHE_TEACHER_FEATURES = True         # False -> cache depth only (less disk, less speedup)
+# Roughly ~3 MB/sample (fp16) at TRAIN_HW + FEATURE_TOKENS=1200 with features cached.
+
+# ---- Champion weight commit guard --------------------------------------------
+MAX_COMMIT_WEIGHTS_MB = 95            # keep committed champion under GitHub's 100MB limit
+
 SEED = 1234
 
 
@@ -362,6 +375,105 @@ def eval_dataset(use_hf: bool = True):
     if not use_hf:
         return LocalExamplesDataset()
     return HFStreamedDataset(_split()["eval"])
+
+
+# ----------------------------------------------------------------------------- #
+#  Teacher-target cache                                                          #
+# ----------------------------------------------------------------------------- #
+# distill_step needs, per sample: the teacher encoder features (at FEATURE_TOKENS) and
+# the teacher's best-quality refined depth. Recomputing those with the ViT-L teacher
+# every step would eat the whole proxy budget, so we cache them to disk, keyed by
+# (FEATURE_TOKENS, sample key). Populated lazily on first touch and reused across every
+# step AND every later experiment. Because the cache is per-sample, training must
+# process each sample at a fixed resolution (TRAIN_HW) — otherwise the targets wouldn't
+# be a stable function of the sample.
+
+def _safe_key(key: str) -> str:
+    return "".join(c if c.isalnum() or c in "-._" else "_" for c in key)[:180]
+
+
+def _canonical_batch(samples: List[Sample], dev) -> Tuple[Any, Any, Any]:
+    """Resize a batch of Samples to the fixed TRAIN_HW canvas and stack into tensors.
+    Intrinsics are normalised by each sample's NATIVE size (normalised intrinsics are
+    resolution-independent), so they stay valid after the resize."""
+    import cv2
+    H, W = TRAIN_HW
+    imgs, raws, Ks = [], [], []
+    for s in samples:
+        H0, W0 = s.rgb.shape[:2]
+        rgb = cv2.resize(s.rgb, (W, H))
+        raw = cv2.resize(s.raw_depth, (W, H), interpolation=cv2.INTER_NEAREST)
+        imgs.append(torch.tensor(rgb / 255.0, dtype=torch.float32).permute(2, 0, 1))
+        raws.append(torch.tensor(raw, dtype=torch.float32))
+        K = s.intrinsics.copy().astype(np.float32); K[0] /= W0; K[1] /= H0
+        Ks.append(torch.tensor(K))
+    return (torch.stack(imgs).to(dev), torch.stack(raws).to(dev), torch.stack(Ks).to(dev))
+
+
+@torch.no_grad()
+def teacher_targets(samples: List[Sample], feature_tokens: int, teacher, dev):
+    """Return (imgs, raws, Ks, t_feat, t_depth) for a batch at TRAIN_HW, using a
+    per-sample disk cache so the teacher runs once per (sample, feature_tokens) instead
+    of every step. imgs/raws are the canonical inputs the student should train on too.
+
+    t_feat: teacher encoder features at `feature_tokens`.  t_depth: teacher best-quality
+    refined depth (infer() default level). Cached fp16; recomputed only on a miss."""
+    imgs, raws, Ks = _canonical_batch(samples, dev)
+    cdir = TARGET_CACHE_DIR / f"tok{feature_tokens}"
+    cdir.mkdir(parents=True, exist_ok=True)
+
+    n = len(samples)
+    feats: List[Any] = [None] * n
+    depths: List[Any] = [None] * n
+    miss = []
+    for i, s in enumerate(samples):
+        f = cdir / (_safe_key(s.key) + ".pt")
+        if f.exists():
+            d = torch.load(f, map_location=dev)
+            depths[i] = d["depth"].float()
+            if CACHE_TEACHER_FEATURES and d.get("feat") is not None:
+                feats[i] = d["feat"].float()
+        else:
+            miss.append(i)
+
+    if miss:
+        mi, mr, mk = imgs[miss], raws[miss], Ks[miss]
+        tf, _ = teacher.infer_feat(mi, depth_in=mr, num_tokens=feature_tokens)
+        td = teacher.infer(mi, depth_in=mr, intrinsics=mk, apply_mask=False)["depth"]
+        for j, i in enumerate(miss):
+            depths[i] = td[j]
+            feats[i] = tf[j]     # use the freshly computed feature (avoid recompute below)
+            torch.save({"depth": td[j].half().cpu(),
+                        "feat": tf[j].half().cpu() if CACHE_TEACHER_FEATURES else None},
+                       cdir / (_safe_key(samples[i].key) + ".pt"))
+
+    # Any features still missing (hits whose cached file predates feature caching) are
+    # recomputed batched — depth still came from the cache.
+    need = [i for i in range(n) if feats[i] is None]
+    if need:
+        tf, _ = teacher.infer_feat(imgs[need], depth_in=raws[need], num_tokens=feature_tokens)
+        for j, i in enumerate(need):
+            feats[i] = tf[j]
+
+    return imgs, raws, Ks, torch.stack(feats), torch.stack(depths)
+
+
+def precompute_teacher_targets(feature_tokens: int, use_hf: bool = True,
+                               batch_size: int = 8, teacher=None) -> int:
+    """Warm the cache over the whole training pool up front (optional — the cache also
+    fills lazily during training). Returns the number of samples processed."""
+    teacher = teacher or load_teacher()
+    ds = train_dataset(use_hf=use_hf)
+    dev = device()
+    n = len(ds)
+    done = 0
+    for start in range(0, n, batch_size):
+        batch = [ds[i] for i in range(start, min(start + batch_size, n))]
+        teacher_targets(batch, feature_tokens, teacher, dev)
+        done += len(batch)
+        if done % (batch_size * 10) == 0 or done == n:
+            print(f"[cache] teacher targets {done}/{n}")
+    return done
 
 
 # ----------------------------------------------------------------------------- #

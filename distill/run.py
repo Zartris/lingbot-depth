@@ -195,8 +195,22 @@ def promote_best(run_id: str, res: dict) -> None:
         shutil.rmtree(dst)
     dst.mkdir(parents=True)
 
-    shutil.copy2(src / "student.pt", dst / "student.pt")
+    # Save weights in fp16 (halves size; inference runs bf16 autocast anyway) so the
+    # champion fits under GitHub's 100MB blob limit without LFS. Guard the size: if it's
+    # still too big, keep only the code snapshot + metadata (weights stay local) so the
+    # push is never rejected.
     ck = torch.load(src / "student.pt", map_location="cpu", weights_only=False)
+    ck_half = {**ck, "model": {k: (v.half() if torch.is_floating_point(v) else v)
+                               for k, v in ck["model"].items()}, "saved_dtype": "float16"}
+    torch.save(ck_half, dst / "student.pt")
+    size_mb = (dst / "student.pt").stat().st_size / 1e6
+    weights_committed = size_mb <= prepare.MAX_COMMIT_WEIGHTS_MB
+    if not weights_committed:
+        (dst / "student.pt").unlink()
+        print(f"[run] champion weights are {size_mb:.0f}MB > {prepare.MAX_COMMIT_WEIGHTS_MB}MB "
+              "limit — committing code snapshot + metadata only (weights stay local; "
+              "use a smaller backbone or LFS to make them travel).")
+
     snap = ck.get("snapshot_pkg")
     if snap and (src / snap).exists():
         shutil.copytree(src / snap, dst / snap,
@@ -209,12 +223,13 @@ def promote_best(run_id: str, res: dict) -> None:
         sha = None
     gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
     meta = {"run_id": run_id, "gpu": gpu, "git_sha": sha,
+            "weights_committed": weights_committed, "weights_mb": round(size_mb, 1),
             "backbone": train.STUDENT_BACKBONE, "tokens": str(train.STUDENT_NUM_TOKENS_RANGE),
             **{k: (round(v, 5) if isinstance(v, float) else v) for k, v in res.items()}}
     (dst / "best.json").write_text(json.dumps(meta, indent=2))
-    subprocess.run(["git", "add", "distill/best", ".gitattributes"], cwd=prepare.REPO_ROOT)
+    subprocess.run(["git", "add", "distill/best"], cwd=prepare.REPO_ROOT)
     print(f"[run] promoted {run_id} -> distill/best/  (score={res.get('score', float('nan')):.2f}, "
-          f"gpu={gpu})  — scores are machine-specific; re-benchmark on other machines")
+          f"{size_mb:.0f}MB fp16, gpu={gpu})  — scores are machine-specific; re-benchmark elsewhere")
 
 
 def _best_score_excluding(run_id: str) -> float:
@@ -252,10 +267,20 @@ def main() -> None:
     ap.add_argument("--compare", nargs="?", const="", default=None,
                     help="teacher vs best-student vs [optional student.pt] across "
                          "resolution levels, then exit")
+    ap.add_argument("--cache-targets", action="store_true",
+                    help="precompute the teacher-target cache over the training pool, then exit")
     ap.add_argument("--hf", action="store_true", help="use the streamed HF dataset (default: local)")
     args = ap.parse_args()
 
     use_hf = args.hf and not args.smoke
+
+    if args.cache_targets:
+        from distill import train
+        print("[run] precomputing teacher targets (this runs the teacher once per sample) ...")
+        n = prepare.precompute_teacher_targets(train.FEATURE_TOKENS, use_hf=use_hf)
+        print(f"[run] cached teacher targets for {n} samples "
+              f"at FEATURE_TOKENS={train.FEATURE_TOKENS}")
+        return
 
     if args.compare is not None:
         compare(args.compare or None, use_hf)

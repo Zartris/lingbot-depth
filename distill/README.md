@@ -44,7 +44,21 @@ python -m distill.run --hf --accept                # real data; commit train.py 
 
 # compare teacher vs best-student-so-far vs a given student across resolution levels
 python -m distill.run --hf --compare               # (optionally pass a student.pt path)
+
+# (optional) warm the teacher-target cache up front, so the first run isn't slow
+python -m distill.run --hf --cache-targets
 ```
+
+## Teacher-target cache
+
+The ViT-L teacher is the expensive part of each step, so its per-sample outputs
+(encoder features at `FEATURE_TOKENS` + best-quality depth) are cached to
+`.cache/teacher_targets/` and reused across every step **and every later experiment** —
+the teacher runs once per `(sample, FEATURE_TOKENS)`, not every step. It fills lazily
+during training, or eagerly via `--cache-targets`. For this to be sound, training
+processes each sample at a fixed canvas (`prepare.TRAIN_HW`, default 480×640); eval
+still runs at native resolution. Budget ~3 MB/sample (fp16); set
+`prepare.CACHE_TEACHER_FEATURES=False` to cache depth only if disk-constrained.
 
 The agent loop: read `program.md` + `runs/results.csv` → edit `train.py` → run →
 read score → repeat.
@@ -63,8 +77,11 @@ scores fidelity-to-teacher) — enough to validate all plumbing before committin
 
 ## Champion & cross-machine notes
 
-Accepted winners are promoted to the committed `best/` (weights via Git LFS) so the
-team's best student travels with the repo. Collaborators need `git lfs install` once.
+Accepted winners are promoted to the committed `best/` so the team's best student
+travels with the repo. Weights are saved **fp16** (~44 MB for ViT-S — under GitHub's
+100 MB blob limit, no LFS needed); if a bigger backbone exceeds
+`prepare.MAX_COMMIT_WEIGHTS_MB`, only the code snapshot + `best.json` are committed and
+the weights stay local (a warning tells you).
 
 ⚠️ **Scores are machine-specific.** Latency (and thus `score`/`speedup`) depend on the
 GPU, so `best.json` records the `gpu` it was measured on. Keep-or-revert **ranking**

@@ -156,27 +156,6 @@ def _copy_matching(dst: torch.nn.Module, src_state: Dict[str, torch.Tensor],
 #  Batch prep                                                                   #
 # --------------------------------------------------------------------------- #
 
-def _to_batch(samples, dev):
-    """Stack a list of Samples into padded tensors at a common size (resize to first)."""
-    H, W = samples[0].rgb.shape[:2]
-    imgs, raws, Ks = [], [], []
-    for s in samples:
-        import cv2
-        rgb = cv2.resize(s.rgb, (W, H)) if s.rgb.shape[:2] != (H, W) else s.rgb
-        raw = cv2.resize(s.raw_depth, (W, H), interpolation=cv2.INTER_NEAREST) \
-            if s.raw_depth.shape[:2] != (H, W) else s.raw_depth
-        imgs.append(torch.tensor(rgb / 255.0, dtype=torch.float32).permute(2, 0, 1))
-        raws.append(torch.tensor(raw, dtype=torch.float32))
-        K = s.intrinsics.copy().astype(np.float32); K[0] /= W; K[1] /= H
-        Ks.append(torch.tensor(K))
-    return (torch.stack(imgs).to(dev), torch.stack(raws).to(dev), torch.stack(Ks).to(dev),
-            samples)
-
-
-# --------------------------------------------------------------------------- #
-#  Losses                                                                       #
-# --------------------------------------------------------------------------- #
-
 def _log_l1(pred, target, valid):
     """L1 in log-depth space on valid pixels (scale-robust, matches remap_depth_out)."""
     if valid.sum() == 0:
@@ -186,22 +165,14 @@ def _log_l1(pred, target, valid):
     return (F.l1_loss(p, t, reduction="none") * valid).sum() / valid.sum().clamp_min(1)
 
 
-def distill_step(student, teacher, batch, dev, feat_proj=None) -> Dict[str, torch.Tensor]:
-    imgs, raws, Ks, samples = batch
-    B = imgs.shape[0]
-
-    # Teacher targets (no grad). In a full run these are precomputed & cached once;
-    # here we compute inline for simplicity.
-    #   - features are taken at FEATURE_TOKENS so the grid matches the student's for
-    #     feature distillation;
-    #   - the output-depth target is the teacher's BEST quality (infer() defaults to
-    #     resolution_level=9, i.e. max tokens) so the student learns to reproduce the
-    #     teacher's best output while running at its own smaller token budget. This is
-    #     a deliberate operating-point choice — change it if you want a cheaper target.
-    with torch.no_grad():
-        t_feat, t_cls = teacher.infer_feat(imgs, depth_in=raws, num_tokens=FEATURE_TOKENS)
-        t_out = teacher.infer(imgs, depth_in=raws, intrinsics=Ks, apply_mask=False)
-        t_depth = t_out["depth"]
+def distill_step(student, teacher, samples, dev, feat_proj=None) -> Dict[str, torch.Tensor]:
+    # Teacher targets come from prepare.teacher_targets — a per-sample disk cache, so the
+    # ViT-L teacher runs once per (sample, FEATURE_TOKENS) instead of every step. It also
+    # returns the canonical (TRAIN_HW) inputs the student trains on.
+    #   - t_feat: teacher encoder features at FEATURE_TOKENS (grid matches the student's).
+    #   - t_depth: teacher BEST-quality refined depth (infer() default level) — the
+    #     student learns the teacher's best output while running its own smaller budget.
+    imgs, raws, Ks, t_feat, t_depth = prepare.teacher_targets(samples, FEATURE_TOKENS, teacher, dev)
 
     # Student forward (with grad). Feature + output heads.
     with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=(dev.type == "cuda")):
@@ -288,8 +259,8 @@ def main(run_dir: Path, use_hf: bool = False) -> Path:
     step = 0
     while (time.time() - t_start) < prepare.TRAIN_MINUTES * 60 and step < prepare.MAX_STEPS:
         idx = rng.integers(0, n, size=BATCH_SIZE)
-        batch = _to_batch([train_set[int(i)] for i in idx], dev)
-        losses = distill_step(student, teacher, batch, dev, feat_proj=feat_proj)
+        samples = [train_set[int(i)] for i in idx]
+        losses = distill_step(student, teacher, samples, dev, feat_proj=feat_proj)
         opt.zero_grad(set_to_none=True)
         losses["total"].backward()
         torch.nn.utils.clip_grad_norm_(params, 1.0)
