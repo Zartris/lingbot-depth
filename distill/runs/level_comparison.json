@@ -1,0 +1,50 @@
+[
+  {
+    "resolution_level": 0,
+    "model": "teacher",
+    "latency_ms": 2.651,
+    "speedup_vs_teacher": 1.0,
+    "absrel_weighted": 0.0,
+    "delta1_weighted": 1.0
+  },
+  {
+    "resolution_level": 0,
+    "model": "best",
+    "latency_ms": 0.02,
+    "speedup_vs_teacher": 133.225,
+    "absrel_weighted": 0.0,
+    "delta1_weighted": 1.0
+  },
+  {
+    "resolution_level": 0,
+    "model": "current",
+    "latency_ms": 0.245,
+    "speedup_vs_teacher": 10.825,
+    "absrel_weighted": 0.02,
+    "delta1_weighted": 1.0
+  },
+  {
+    "resolution_level": 9,
+    "model": "teacher",
+    "latency_ms": 0.015,
+    "speedup_vs_teacher": 1.0,
+    "absrel_weighted": 0.0,
+    "delta1_weighted": 1.0
+  },
+  {
+    "resolution_level": 9,
+    "model": "best",
+    "latency_ms": 0.015,
+    "speedup_vs_teacher": 1.003,
+    "absrel_weighted": 0.0,
+    "delta1_weighted": 1.0
+  },
+  {
+    "resolution_level": 9,
+    "model": "current",
+    "latency_ms": 0.015,
+    "speedup_vs_teacher": 0.979,
+    "absrel_weighted": 0.02,
+    "delta1_weighted": 1.0
+  }
+]

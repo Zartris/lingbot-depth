@@ -17,6 +17,8 @@ Usage:
   python -m distill.run --accept            # ... and git-commit train.py if it improved
   python -m distill.run --smoke             # tiny local (no-download) plumbing check
   python -m distill.run --eval-only PATH    # score an existing student.pt
+  python -m distill.run --compare [PATH]    # teacher vs best-student vs [PATH] across
+                                            #   resolution levels (latency/acc/speedup)
 """
 from __future__ import annotations
 
@@ -51,6 +53,54 @@ def _load_student(ckpt_path: Path):
 def _eval_set(use_hf: bool):
     # The eval set is frozen in prepare.py and disjoint from the training pool.
     return prepare.eval_dataset(use_hf=use_hf)
+
+
+def find_best_student() -> "Path | None":
+    """Path to the best-scoring student.pt so far (min score in results.csv)."""
+    path = prepare.RUNS_DIR / "results.csv"
+    if not path.exists():
+        return None
+    best_row, best = None, float("inf")
+    with path.open() as f:
+        for r in csv.DictReader(f):
+            try:
+                s = float(r["score"])
+            except (KeyError, ValueError):
+                continue
+            if s < best:
+                best, best_row = s, r
+    if best_row is None:
+        return None
+    ckpt = prepare.RUNS_DIR / best_row["run_id"] / "student.pt"
+    return ckpt if ckpt.exists() else None
+
+
+def _print_level_table(rows: list) -> None:
+    print(f"      {'level':>5} {'model':>8} {'latency_ms':>11} {'speedup':>8} "
+          f"{'absrel_w':>9} {'delta1_w':>9}")
+    for r in rows:
+        sp = f"{r['speedup_vs_teacher']:.2f}x" if r["speedup_vs_teacher"] else "   -  "
+        print(f"      {r['resolution_level']:>5} {r['model']:>8} {r['latency_ms']:>11.1f} "
+              f"{sp:>8} {r['absrel_weighted']:>9.4f} {r['delta1_weighted']:>9.4f}")
+
+
+def compare(current_ckpt: "str | None", use_hf: bool) -> None:
+    """Compare teacher vs best-student-so-far vs a given/current student across
+    resolution levels (latency, accuracy, speedup at each level)."""
+    models = {"teacher": prepare.load_teacher()}
+    best = find_best_student()
+    if best is not None:
+        models["best"] = _load_student(best)
+        print(f"[run] best student: {best}")
+    if current_ckpt:
+        models["current"] = _load_student(Path(current_ckpt))
+        print(f"[run] current student: {current_ckpt}")
+    if "best" not in models and not current_ckpt:
+        print("[run] no student checkpoints yet — showing teacher sweep only.")
+    print("[run] latency/accuracy/speedup across resolution_level:")
+    rows = prepare.compare_across_levels(models, _eval_set(use_hf))
+    _print_level_table(rows)
+    print(f"[run] wrote {prepare.RUNS_DIR/'level_comparison.json'}")
 
 
 def _append_result(row: dict) -> None:
@@ -149,10 +199,17 @@ def main() -> None:
     ap.add_argument("--accept", action="store_true", help="git-commit train.py if score improved")
     ap.add_argument("--smoke", action="store_true", help="local no-download plumbing check")
     ap.add_argument("--eval-only", type=str, default=None, help="score an existing student.pt")
+    ap.add_argument("--compare", nargs="?", const="", default=None,
+                    help="teacher vs best-student vs [optional student.pt] across "
+                         "resolution levels, then exit")
     ap.add_argument("--hf", action="store_true", help="use the streamed HF dataset (default: local)")
     args = ap.parse_args()
 
     use_hf = args.hf and not args.smoke
+
+    if args.compare is not None:
+        compare(args.compare or None, use_hf)
+        return
 
     if args.eval_only:
         base = prepare.load_baseline()

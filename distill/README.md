@@ -40,6 +40,9 @@ python -m distill.run --setup-baseline            # add --hf to use the real dat
 # 3. one research iteration: train a student, eval, log the score
 python -m distill.run                              # local examples (plumbing)
 python -m distill.run --hf --accept                # real data; commit train.py if better
+
+# compare teacher vs best-student-so-far vs a given student across resolution levels
+python -m distill.run --hf --compare               # (optionally pass a student.pt path)
 ```
 
 The agent loop: read `program.md` + `runs/results.csv` → edit `train.py` → run →

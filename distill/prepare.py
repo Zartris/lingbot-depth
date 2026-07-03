@@ -534,11 +534,13 @@ def evaluate(model: "torch.nn.Module", eval_set, base: Optional[Baseline] = None
         return {k: float(np.nanmean([r[k] for r in rows])) for k in rows[0]}
 
     real, sim = agg("real"), agg("sim")
-    # Weighted accuracy across domains (fall back to whichever exists).
-    wr, ws = (ACC_WEIGHT_REAL, ACC_WEIGHT_SIM) if (real and sim) else (
-        (1.0, 0.0) if real else (0.0, 1.0))
-    absrel_w = wr * real.get("absrel", np.nan) + ws * sim.get("absrel", np.nan)
-    delta1_w = wr * real.get("delta1", np.nan) + ws * sim.get("delta1", np.nan)
+    # Weighted accuracy across whichever domains are present, renormalising the weights
+    # over them (so a real-only or sim-only eval set doesn't get nan-poisoned by the
+    # absent domain, and 0*nan can never leak in).
+    parts = ([(ACC_WEIGHT_REAL, real)] if real else []) + ([(ACC_WEIGHT_SIM, sim)] if sim else [])
+    wsum = sum(w for w, _ in parts) or 1.0
+    absrel_w = sum(w * d["absrel"] for w, d in parts) / wsum
+    delta1_w = sum(w * d["delta1"] for w, d in parts) / wsum
 
     latency = benchmark_latency(model, resolution_level=resolution_level)
     result: Dict[str, float] = {
@@ -591,6 +593,40 @@ def teacher_resolution_report(eval_set, teacher: Optional["torch.nn.Module"] = N
         })
     (RUNS_DIR / "teacher_resolution_sweep.json").write_text(json.dumps(rows, indent=2))
     return rows
+
+
+def compare_across_levels(models: Dict[str, "torch.nn.Module"], eval_set,
+                          levels: List[int] = RESOLUTION_SWEEP) -> List[Dict[str, float]]:
+    """Evaluate several named models (e.g. {'teacher', 'best', 'current'}) at each
+    resolution_level and report per-level latency, accuracy, and speedup vs the
+    'teacher' model AT THAT SAME LEVEL. Returns flat rows (one per level×model) and
+    saves runs/level_comparison.json.
+
+    This is the apples-to-apples view: it shows whether the student actually beats the
+    teacher's speed/accuracy trade-off at every operating point, not just at level 9,
+    and how the current student stacks up against the best one so far."""
+    teacher = models.get("teacher")
+    flat: List[Dict[str, float]] = []
+    for lvl in levels:
+        measured = []
+        for name, m in models.items():
+            if m is None:
+                continue
+            r = evaluate(m, eval_set, base=None, teacher=teacher, resolution_level=lvl)
+            measured.append((name, r))
+        t_lat = next((r["latency_ms"] for n, r in measured if n == "teacher"), None)
+        for name, r in measured:
+            lat = r["latency_ms"]
+            flat.append({
+                "resolution_level": lvl,
+                "model": name,
+                "latency_ms": round(lat, 3),
+                "speedup_vs_teacher": round(t_lat / lat, 3) if (t_lat and lat) else None,
+                "absrel_weighted": round(r["absrel_weighted"], 5),
+                "delta1_weighted": round(r["delta1_weighted"], 5),
+            })
+    (RUNS_DIR / "level_comparison.json").write_text(json.dumps(flat, indent=2))
+    return flat
 
 
 def load_baseline() -> Optional[Baseline]:
