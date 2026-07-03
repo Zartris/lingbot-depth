@@ -15,7 +15,7 @@ Contents
   Constants            budgets, tolerances, the sim/real accuracy weighting
   load_teacher()       frozen teacher MDMModel (cached)
   derive_student_config()  build a valid smaller MDMModel config from the teacher's
-  build_index()/datasets   stream a subset of robbyant/mdm_depth (rawdepth/gtdepth/rgb)
+  train_dataset()/eval_dataset()  frozen, disjoint subset of robbyant/mdm_depth
   cache_teacher_targets()  precompute + cache teacher depth/features for fast inner loop
   depth_metrics()      AbsRel / RMSE / SILog / delta1..3 / masked-completion error
   benchmark_latency()  warmup + CUDA-synced median ms + params
@@ -75,6 +75,21 @@ BENCH_INPUT_HW = (480, 640)   # fixed input size so latency numbers are comparab
 BENCH_WARMUP = 10
 BENCH_ITERS = 50
 BENCH_RESOLUTION_LEVEL = 9    # matches model.infer default
+
+# ---- Dataset subset (FROZEN) -------------------------------------------------
+# The same training pool and the same eval set for EVERY experiment. Frozen here so
+# a score difference reflects a better student, not more/different data, and so the
+# agent can never change what it is scored on (the eval set is its exam).
+N_TRAIN_REAL = 4000
+N_TRAIN_SIM = 1500
+N_EVAL_REAL = 200
+N_EVAL_SIM = 100
+
+# ---- Compute budget per experiment (FROZEN) ----------------------------------
+# Equal compute per run => comparable scores (autoresearch's fixed-budget premise).
+# The agent optimises what to do WITHIN this budget, not the budget itself.
+TRAIN_MINUTES = 20.0          # proxy-run wall-clock; humans promote winners to longer runs
+MAX_STEPS = 100_000           # hard cap
 
 SEED = 1234
 
@@ -193,7 +208,7 @@ def derive_student_config(
 #   eval   -> gt_depth    (the ground truth the score is measured against)
 #
 # The full dataset is a 2.71 TB file tree (color/ gtdepth/ rawdepth/ per camera).
-# We NEVER pull it all — build_index() lists the repo and downloads a small subset.
+# We NEVER pull it all — _all_triplets() lists the repo and we cache a small subset.
 #
 # For instant plumbing checks with no download, LocalExamplesDataset uses the 8
 # scenes bundled in ./examples (which have rgb + raw_depth + intrinsics but no gt,
@@ -250,11 +265,13 @@ class LocalExamplesDataset:
 _RAW_DIR, _GT_DIR, _RGB_DIR = "rawdepth", "gtdepth", "color"
 
 
-def build_index(n_real: int, n_sim: int, seed: int = SEED) -> List[Dict[str, str]]:
-    """List the dataset repo and pick a balanced subset of (rgb, raw, gt) triplets."""
+def _all_triplets(seed: int = SEED) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+    """List the dataset repo once; return (real, sim) triplet lists, shuffled
+    deterministically. The listing + shuffle is cached so the split is stable."""
     from huggingface_hub import HfApi
 
     files = HfApi().list_repo_files(DATASET_ID, repo_type="dataset")
+    file_set = set(files)
     raws = [f for f in files if f"/{_RAW_DIR}/" in f]
 
     def triplet(raw_path: str) -> Optional[Dict[str, str]]:
@@ -262,8 +279,8 @@ def build_index(n_real: int, n_sim: int, seed: int = SEED) -> List[Dict[str, str
         gt = raw_path.replace(f"/{_RAW_DIR}/", f"/{_GT_DIR}/")
         # rgb may be jpg while depth is png
         rgb_candidates = [rgb, str(Path(rgb).with_suffix(".jpg")), str(Path(rgb).with_suffix(".png"))]
-        rgb = next((c for c in rgb_candidates if c in files), None)
-        if rgb is None or gt not in files:
+        rgb = next((c for c in rgb_candidates if c in file_set), None)
+        if rgb is None or gt not in file_set:
             return None
         domain = "sim" if "RobbySim" in raw_path else "real"
         return {"raw": raw_path, "rgb": rgb, "gt": gt, "domain": domain, "key": raw_path}
@@ -273,7 +290,23 @@ def build_index(n_real: int, n_sim: int, seed: int = SEED) -> List[Dict[str, str
     real = [t for t in triplets if t["domain"] == "real"]
     sim = [t for t in triplets if t["domain"] == "sim"]
     rng.shuffle(real); rng.shuffle(sim)
-    return real[:n_real] + sim[:n_sim]
+    return real, sim
+
+
+_SPLIT: Dict[str, List[Dict[str, str]]] = {}
+
+
+def _split() -> Dict[str, List[Dict[str, str]]]:
+    """The FROZEN train/eval split. Eval is reserved from the front of the shuffled
+    lists and training from immediately after, so the two are guaranteed disjoint."""
+    if not _SPLIT:
+        real, sim = _all_triplets()
+        _SPLIT["eval"] = real[:N_EVAL_REAL] + sim[:N_EVAL_SIM]
+        _SPLIT["train"] = (
+            real[N_EVAL_REAL:N_EVAL_REAL + N_TRAIN_REAL]
+            + sim[N_EVAL_SIM:N_EVAL_SIM + N_TRAIN_SIM]
+        )
+    return _SPLIT
 
 
 class HFStreamedDataset:
@@ -307,12 +340,19 @@ class HFStreamedDataset:
                       domain=rec["domain"], key=rec["key"])
 
 
-def get_datasets(n_real: int, n_sim: int, use_hf: bool) -> Tuple[Any, List[Dict[str, str]]]:
-    """Return (train_dataset, index). Use `use_hf=False` for the local smoke test."""
+def train_dataset(use_hf: bool = True):
+    """The frozen training pool. `use_hf=False` -> local ./examples (smoke test)."""
     if not use_hf:
-        return LocalExamplesDataset(), []
-    index = build_index(n_real=n_real, n_sim=n_sim)
-    return HFStreamedDataset(index), index
+        return LocalExamplesDataset()
+    return HFStreamedDataset(_split()["train"])
+
+
+def eval_dataset(use_hf: bool = True):
+    """The frozen eval set — the student's exam. Disjoint from the training pool.
+    `use_hf=False` -> local ./examples (smoke test)."""
+    if not use_hf:
+        return LocalExamplesDataset()
+    return HFStreamedDataset(_split()["eval"])
 
 
 # ----------------------------------------------------------------------------- #

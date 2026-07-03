@@ -49,12 +49,8 @@ def _load_student(ckpt_path: Path):
 
 
 def _eval_set(use_hf: bool):
-    if not use_hf:
-        return prepare.LocalExamplesDataset()
-    from distill import train
-    idx = prepare.build_index(n_real=train.N_EVAL_REAL, n_sim=train.N_EVAL_SIM,
-                              seed=prepare.SEED + 1)  # disjoint seed from training subset
-    return prepare.HFStreamedDataset(idx)
+    # The eval set is frozen in prepare.py and disjoint from the training pool.
+    return prepare.eval_dataset(use_hf=use_hf)
 
 
 def _append_result(row: dict) -> None:
@@ -88,7 +84,7 @@ def one_iteration(accept: bool, use_hf: bool) -> dict:
     run_dir = prepare.RUNS_DIR / run_id
     print(f"[run] === iteration {run_id} ===")
 
-    ckpt = train.main(run_dir)
+    ckpt = train.main(run_dir, use_hf=use_hf)
     student = _load_student(ckpt)
 
     print("[run] evaluating ...")

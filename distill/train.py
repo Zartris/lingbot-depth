@@ -40,7 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from distill import prepare  # noqa: E402
 from distill.prepare import (  # noqa: E402
-    device, load_teacher, derive_student_config, get_datasets, Sample,
+    device, load_teacher, derive_student_config,
 )
 
 # --------------------------------------------------------------------------- #
@@ -63,16 +63,11 @@ WEIGHT_DECAY = 0.05
 BATCH_SIZE = 2
 WARM_START_DECODER = True  # copy teacher neck/heads into the student (big head start)
 
-# --- budget (this is the "5-minute" knob from autoresearch) ----------------- #
-TRAIN_MINUTES = 20.0       # proxy-run wall-clock budget; promote winners to longer runs
-MAX_STEPS = 100_000        # hard cap
-
-# --- data ------------------------------------------------------------------- #
-USE_HF = False             # False -> local ./examples smoke test (no download / no gt)
-N_TRAIN_REAL = 4000
-N_TRAIN_SIM = 1500
-N_EVAL_REAL = 200
-N_EVAL_SIM = 100
+# NOTE: the training data pool, the eval set, and the compute budget
+# (TRAIN_MINUTES / MAX_STEPS) are FROZEN in distill/prepare.py — not here — so every
+# experiment runs on equal data at equal compute and the agent can't change its own
+# exam. You control how the data is *used* (BATCH_SIZE, sampling, augmentation), not
+# how much there is or how long you train.
 
 
 # --------------------------------------------------------------------------- #
@@ -207,7 +202,7 @@ def distill_step(student, teacher, batch, dev) -> Dict[str, torch.Tensor]:
 #  Train                                                                        #
 # --------------------------------------------------------------------------- #
 
-def main(run_dir: Path) -> Path:
+def main(run_dir: Path, use_hf: bool = False) -> Path:
     torch.manual_seed(prepare.SEED)
     dev = device()
     print(f"[train] device={dev} backbone={STUDENT_BACKBONE} tokens={STUDENT_NUM_TOKENS_RANGE}")
@@ -216,9 +211,9 @@ def main(run_dir: Path) -> Path:
     student = build_student()
     student.train()
 
-    train_set, _ = get_datasets(N_TRAIN_REAL, N_TRAIN_SIM, use_hf=USE_HF)
+    train_set = prepare.train_dataset(use_hf=use_hf)   # FROZEN pool (see prepare.py)
     n = len(train_set)
-    print(f"[train] {n} training samples ({'HF stream' if USE_HF else 'local examples'})")
+    print(f"[train] {n} training samples ({'HF stream' if use_hf else 'local examples'})")
 
     opt = torch.optim.AdamW(
         [p for p in student.parameters() if p.requires_grad], lr=LR, weight_decay=WEIGHT_DECAY)
@@ -226,7 +221,7 @@ def main(run_dir: Path) -> Path:
     rng = np.random.default_rng(prepare.SEED)
     t_start = time.time()
     step = 0
-    while (time.time() - t_start) < TRAIN_MINUTES * 60 and step < MAX_STEPS:
+    while (time.time() - t_start) < prepare.TRAIN_MINUTES * 60 and step < prepare.MAX_STEPS:
         idx = rng.integers(0, n, size=BATCH_SIZE)
         batch = _to_batch([train_set[int(i)] for i in idx], dev)
         losses = distill_step(student, teacher, batch, dev)

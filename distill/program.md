@@ -34,10 +34,15 @@ wins that also cut params/FLOPs, since those port across hardware.
   `intermediate_layers`, `STUDENT_NUM_TOKENS_RANGE`, neck/head widths, or a custom
   lightweight student module (token merging/pruning, distilled decoder, ...).
 - Distillation recipe — loss terms & weights (`W_OUTPUT_DISTILL`, `W_FEATURE_DISTILL`,
-  `W_GT`), optimiser, LR schedule, augmentations, `BATCH_SIZE`, `TRAIN_MINUTES`.
+  `W_GT`), optimiser, LR schedule, augmentations, `BATCH_SIZE`, sampling/curriculum.
 
 **You may NOT touch** (they define the problem and keep the score honest):
-- `distill/prepare.py` — data, teacher, metrics, latency, objective. Frozen.
+- `distill/prepare.py` — data, teacher, metrics, latency, objective. Frozen. This
+  includes the **training pool**, the **eval set** (your exam — you cannot change what
+  you're scored on), and the **compute budget** (`TRAIN_MINUTES` / `MAX_STEPS`). Every
+  experiment therefore runs on equal data at equal compute, so a better score means a
+  genuinely better student — not more data or more time. You control how the data is
+  *used* (batching, sampling, augmentation), not how much there is or how long you train.
 - the `mdm/` package — defines the frozen teacher. Frozen.
 
 **Hard contract:** whatever `build_student()` returns MUST expose
@@ -57,9 +62,9 @@ python -m distill.run --setup-baseline   # ONCE: measure the teacher (anchors th
 ```
 
 Proxy runs are short (`TRAIN_MINUTES≈20`) so you can rank ideas fast. When a config
-clearly wins, a human promotes it to a longer run (raise `TRAIN_MINUTES`, enlarge the
-data subset). This mirrors autoresearch's "rank cheaply on short runs, scale the
-winner".
+clearly wins, a **human** promotes it to a longer run by editing the frozen budget in
+`prepare.py` (raise `TRAIN_MINUTES`, enlarge the data subset) — the agent never does
+this itself. This mirrors autoresearch's "rank cheaply on short runs, scale the winner".
 
 ## Suggested idea backlog (roughly cheap→deep)
 
