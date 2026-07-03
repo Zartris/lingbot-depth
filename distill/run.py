@@ -12,6 +12,8 @@ this -> read the new score -> repeat.  Because prepare.py and mdm/ are frozen, t
 only way the score can improve is a genuinely better student.
 
 Usage:
+  python -m distill.run --smoke             # logic self-test (no GPU, no downloads)
+  python -m distill.run --test-run          # tiny end-to-end pipeline check on GPU
   python -m distill.run --setup-baseline   # measure the teacher once (do this first)
   python -m distill.run                     # one train+eval iteration, log the score
   python -m distill.run --accept            # ... and git-commit train.py if it improved
@@ -34,6 +36,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from distill import prepare  # noqa: E402
+
+# Budget for `--test-run`: a few steps / ~1 min, just to exercise the whole pipeline.
+TEST_RUN_MINUTES = 1.0
+TEST_RUN_STEPS = 6
 
 
 def _student_class_from_snapshot(ckpt_path: Path, snap: str):
@@ -144,7 +150,8 @@ def setup_baseline(use_hf: bool) -> None:
           f"{prepare.RUNS_DIR/'teacher_resolution_sweep.json'}")
 
 
-def one_iteration(accept: bool, use_hf: bool) -> dict:
+def one_iteration(accept: bool, use_hf: bool, minutes: float = None,
+                  max_steps: int = None) -> dict:
     from distill import train
 
     base = prepare.load_baseline()
@@ -156,7 +163,7 @@ def one_iteration(accept: bool, use_hf: bool) -> dict:
     run_dir = prepare.RUNS_DIR / run_id
     print(f"[run] === iteration {run_id} ===")
 
-    ckpt = train.main(run_dir, use_hf=use_hf)
+    ckpt = train.main(run_dir, use_hf=use_hf, minutes=minutes, max_steps=max_steps)
     student = _load_student(ckpt)
 
     print("[run] evaluating ...")
@@ -269,10 +276,26 @@ def main() -> None:
                          "resolution levels, then exit")
     ap.add_argument("--cache-targets", action="store_true",
                     help="precompute the teacher-target cache over the training pool, then exit")
+    ap.add_argument("--test-run", action="store_true",
+                    help="tiny end-to-end pipeline check on GPU (a few steps, local examples), "
+                         "no commit — run this before the first real iteration")
     ap.add_argument("--hf", action="store_true", help="use the streamed HF dataset (default: local)")
     args = ap.parse_args()
 
     use_hf = args.hf and not args.smoke
+
+    if args.test_run:
+        if prepare.load_baseline() is None:
+            print("[run] no baseline yet — measuring the teacher first ...")
+            setup_baseline(use_hf)
+        print("[run] === TEST RUN === validates the full pipeline end-to-end "
+              "(build -> warm-start -> cache -> few steps -> eval -> save/reload -> score). "
+              "Not a real experiment; nothing is committed.")
+        one_iteration(accept=False, use_hf=use_hf,
+                      minutes=TEST_RUN_MINUTES, max_steps=TEST_RUN_STEPS)
+        print("[run] === TEST RUN OK === pipeline works end-to-end. "
+              "Next: `--setup-baseline --hf` then real iterations.")
+        return
 
     if args.cache_targets:
         from distill import train

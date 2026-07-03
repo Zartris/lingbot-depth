@@ -35,10 +35,14 @@ python -m pip install -e .
 # 1. sanity-check the harness logic — no GPU, no downloads
 python -m distill.run --smoke
 
-# 2. measure the teacher once (needs GPU + downloads the teacher ckpt)
+# 2. tiny end-to-end pipeline check on GPU (~1-2 min, local examples, no dataset download)
+#    build -> warm-start -> cache -> a few steps -> eval -> save/reload -> score
+python -m distill.run --test-run
+
+# 3. measure the teacher once (needs GPU + downloads the teacher ckpt)
 python -m distill.run --setup-baseline            # add --hf to use the real dataset
 
-# 3. one research iteration: train a student, eval, log the score
+# 4. one research iteration: train a student, eval, log the score
 python -m distill.run                              # local examples (plumbing)
 python -m distill.run --hf --accept                # real data; commit train.py if better
 

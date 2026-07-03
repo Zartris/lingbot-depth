@@ -227,10 +227,17 @@ def distill_step(student, teacher, samples, dev, feat_proj=None) -> Dict[str, to
 #  Train                                                                        #
 # --------------------------------------------------------------------------- #
 
-def main(run_dir: Path, use_hf: bool = False) -> Path:
+def main(run_dir: Path, use_hf: bool = False,
+         minutes: float = None, max_steps: int = None) -> Path:
+    # `minutes`/`max_steps` override the frozen budget for a quick TEST RUN only
+    # (passed by the runner, never by the agent). Default None -> the frozen budget.
+    budget_min = prepare.TRAIN_MINUTES if minutes is None else minutes
+    budget_steps = prepare.MAX_STEPS if max_steps is None else max_steps
+
     torch.manual_seed(prepare.SEED)
     dev = device()
-    print(f"[train] device={dev} backbone={STUDENT_BACKBONE} tokens={STUDENT_NUM_TOKENS_RANGE}")
+    print(f"[train] device={dev} backbone={STUDENT_BACKBONE} tokens={STUDENT_NUM_TOKENS_RANGE} "
+          f"budget={budget_min:.2f}min/{budget_steps}steps")
 
     teacher = load_teacher()
     student, student_cfg = build_student()
@@ -257,7 +264,7 @@ def main(run_dir: Path, use_hf: bool = False) -> Path:
     rng = np.random.default_rng(prepare.SEED)
     t_start = time.time()
     step = 0
-    while (time.time() - t_start) < prepare.TRAIN_MINUTES * 60 and step < prepare.MAX_STEPS:
+    while (time.time() - t_start) < budget_min * 60 and step < budget_steps:
         idx = rng.integers(0, n, size=BATCH_SIZE)
         samples = [train_set[int(i)] for i in idx]
         losses = distill_step(student, teacher, samples, dev, feat_proj=feat_proj)
