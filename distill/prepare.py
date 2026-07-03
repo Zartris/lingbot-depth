@@ -89,10 +89,13 @@ RESOLUTION_SWEEP = [0, 3, 6, 9]
 # The same training pool and the same eval set for EVERY experiment. Frozen here so
 # a score difference reflects a better student, not more/different data, and so the
 # agent can never change what it is scored on (the eval set is its exam).
-N_TRAIN_REAL = 4000
-N_TRAIN_SIM = 1500
-N_EVAL_REAL = 200
+# Sim by default (RobbySimVal has perfect GT and streams cheaply). Real shards are
+# wired but default to 0 — their modality-grouped layout has a ~3 GB/camera streaming
+# floor, so enable real deliberately (set N_*_REAL > 0) once you accept that cost.
+N_TRAIN_SIM = 1200
+N_TRAIN_REAL = 0
 N_EVAL_SIM = 100
+N_EVAL_REAL = 0
 
 # ---- Compute budget per experiment (FROZEN) ----------------------------------
 # Equal compute per run => comparable scores (autoresearch's fixed-budget premise).
@@ -276,105 +279,171 @@ class LocalExamplesDataset:
                       domain="real", key=d.name)
 
 
-# --- HF-streamed subset ------------------------------------------------------ #
+# --- HF-streamed subset (WebDataset-style .tar.zst shards) ------------------- #
 #
-# NOTE: the exact folder regexes below are written against the dataset card
-# (color/ gtdepth/ rawdepth/ per camera, RobbySim*/ for simulated).  Confirm them
-# against `HfApi().list_repo_files(DATASET_ID, repo_type="dataset")` the first time
-# you stream — that is the single place that may need a one-line tweak, and it lives
-# in this immutable file on purpose.
+# The dataset ships as huge compressed tar shards (47-320 GB each), NOT a browsable
+# file tree. So we STREAM a shard, decompress on the fly, and pull only the first N
+# complete (rgb, raw, gt) triplets off the front — downloading a few hundred MB, not
+# the whole shard. Extracted samples are disk-cached, so re-runs are free.
+#
+# Shard layouts differ by family (verified by streaming the real tree):
+#   RobbySimVal      <stem>_rgb.left.jpg | _rawdepth.left.png | _depth_left.png   (interleaved)
+#   RobbySim *_view  <stem>_left.jpg     | _rmd2c.png (raw)    | _depth.png        (interleaved)
+#   RobbyReal        <cam>/{color,rawdepth,gtdepth}/<frame>.<ext>                 (grouped by modality)
+# Needs `requests` + `zstandard` installed.
 
-_RAW_DIR, _GT_DIR, _RGB_DIR = "rawdepth", "gtdepth", "color"
-
-
-def _all_triplets(seed: int = SEED) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
-    """List the dataset repo once; return (real, sim) triplet lists, shuffled
-    deterministically. The listing + shuffle is cached so the split is stable."""
-    from huggingface_hub import HfApi
-
-    files = HfApi().list_repo_files(DATASET_ID, repo_type="dataset")
-    file_set = set(files)
-    raws = [f for f in files if f"/{_RAW_DIR}/" in f]
-
-    def triplet(raw_path: str) -> Optional[Dict[str, str]]:
-        rgb = raw_path.replace(f"/{_RAW_DIR}/", f"/{_RGB_DIR}/")
-        gt = raw_path.replace(f"/{_RAW_DIR}/", f"/{_GT_DIR}/")
-        # rgb may be jpg while depth is png
-        rgb_candidates = [rgb, str(Path(rgb).with_suffix(".jpg")), str(Path(rgb).with_suffix(".png"))]
-        rgb = next((c for c in rgb_candidates if c in file_set), None)
-        if rgb is None or gt not in file_set:
-            return None
-        domain = "sim" if "RobbySim" in raw_path else "real"
-        return {"raw": raw_path, "rgb": rgb, "gt": gt, "domain": domain, "key": raw_path}
-
-    triplets = [t for t in (triplet(r) for r in raws) if t is not None]
-    rng = np.random.default_rng(seed)
-    real = [t for t in triplets if t["domain"] == "real"]
-    sim = [t for t in triplets if t["domain"] == "sim"]
-    rng.shuffle(real); rng.shuffle(sim)
-    return real, sim
+HF_RESOLVE = f"https://huggingface.co/datasets/{DATASET_ID}/resolve/main"
+SHARD_CACHE = CACHE_DIR / "shards"
+_MAX_SCAN_MEMBERS = 400_000   # safety cap on how deep we stream into a shard
 
 
-_SPLIT: Dict[str, List[Dict[str, str]]] = {}
+def _parse_simval(name: str):
+    if name.endswith("_rgb.left.jpg"):      return name[:-13], "rgb"
+    if name.endswith("_rawdepth.left.png"): return name[:-18], "raw"
+    if name.endswith("_depth_left.png"):    return name[:-15], "gt"
+    return None
 
 
-def _split() -> Dict[str, List[Dict[str, str]]]:
-    """The FROZEN train/eval split. Eval is reserved from the front of the shuffled
-    lists and training from immediately after, so the two are guaranteed disjoint."""
-    if not _SPLIT:
-        real, sim = _all_triplets()
-        _SPLIT["eval"] = real[:N_EVAL_REAL] + sim[:N_EVAL_SIM]
-        _SPLIT["train"] = (
-            real[N_EVAL_REAL:N_EVAL_REAL + N_TRAIN_REAL]
-            + sim[N_EVAL_SIM:N_EVAL_SIM + N_TRAIN_SIM]
-        )
-    return _SPLIT
+def _parse_sim(name: str):
+    if name.endswith("_left.jpg"):  return name[:-9], "rgb"
+    if name.endswith("_rmd2c.png"): return name[:-10], "raw"
+    if name.endswith("_depth.png"): return name[:-10], "gt"
+    return None
 
 
-class HFStreamedDataset:
-    """Downloads (and disk-caches) a fixed subset of triplets from the HF dataset."""
+def _parse_real(name: str):
+    parts = name.split("/")
+    if len(parts) < 2:
+        return None
+    modality, frame = parts[-2], parts[-1].rsplit(".", 1)[0]
+    stem = "/".join(parts[:-2]) + "/" + frame
+    return {"color": (stem, "rgb"), "rawdepth": (stem, "raw"),
+            "gtdepth": (stem, "gt")}.get(modality)
 
-    def __init__(self, index: List[Dict[str, str]]):
-        self.index = index
+
+# shard file -> (member-name parser, domain)
+SHARDS: Dict[str, Tuple[Any, str]] = {
+    "RobbySimVal_batch_0001.tar.zst": (_parse_simval, "sim"),
+    "RobbySim_object_view_batch_0001.tar.zst": (_parse_sim, "sim"),
+    "RobbyReal_batch_0001.tar.zst": (_parse_real, "real"),
+    "RobbyReal_batch_0002.tar.zst": (_parse_real, "real"),
+}
+
+# Which shards feed which split. Train and eval use DIFFERENT shards -> guaranteed
+# disjoint. Real shards are wired but default to 0 samples (N_*_REAL): their
+# modality-grouped layout means ~3 GB must be streamed per camera before the first
+# triplet completes, so enable real deliberately once you accept that cost.
+EVAL_SIM_SHARD, EVAL_REAL_SHARD = "RobbySimVal_batch_0001.tar.zst", "RobbyReal_batch_0001.tar.zst"
+TRAIN_SIM_SHARD, TRAIN_REAL_SHARD = "RobbySim_object_view_batch_0001.tar.zst", "RobbyReal_batch_0002.tar.zst"
+
+
+def _cached_sample_dirs(dest: Path) -> List[Path]:
+    return sorted(p for p in dest.glob("*")
+                  if p.is_dir() and p.name != "_staging" and (p / "rgb").exists())
+
+
+def _stream_shard_samples(shard: str, n: int, cache_subdir: str) -> List[Path]:
+    """Stream `shard`, extract the first `n` complete (rgb, raw, gt) triplets to a disk
+    cache, and return their directories. Disk-buffered via a staging dir, so the
+    modality-grouped real shards don't blow up RAM. Cached, so re-runs are free."""
+    if n <= 0:
+        return []
+    import requests, zstandard, tarfile, shutil
+
+    dest = SHARD_CACHE / cache_subdir
+    dest.mkdir(parents=True, exist_ok=True)
+    ready = _cached_sample_dirs(dest)
+    if len(ready) >= n:
+        return ready[:n]
+    if shard not in SHARDS:
+        raise ValueError(f"unknown shard {shard!r}")
+    parser, domain = SHARDS[shard]
+
+    staging = dest / "_staging"
+    staging.mkdir(exist_ok=True)
+    seen: Dict[str, set] = {}
+    complete = list(ready)
+    print(f"[data] streaming {shard} for {n - len(complete)} more '{domain}' samples -> {dest}")
+
+    with requests.get(f"{HF_RESOLVE}/{shard}", stream=True, timeout=(30, 300)) as r:
+        r.raise_for_status()
+        reader = zstandard.ZstdDecompressor().stream_reader(r.raw)
+        tar = tarfile.open(fileobj=reader, mode="r|")
+        scanned = 0
+        for m in tar:
+            if not m.isfile():
+                continue
+            scanned += 1
+            if scanned > _MAX_SCAN_MEMBERS:
+                warnings.warn(f"{shard}: scan cap reached with {len(complete)}/{n} samples")
+                break
+            pk = parser(m.name)
+            if pk is None:
+                continue
+            stem, kind = pk
+            sid = _safe_key(stem)
+            if (dest / sid).is_dir():
+                continue
+            (staging / f"{sid}.{kind}").write_bytes(tar.extractfile(m).read())
+            seen.setdefault(sid, set()).add(kind)
+            if {"rgb", "raw", "gt"} <= seen[sid]:
+                sdir = dest / sid
+                sdir.mkdir()
+                for k in ("rgb", "raw", "gt"):
+                    shutil.move(str(staging / f"{sid}.{k}"), str(sdir / k))
+                (sdir / "domain").write_text(domain)
+                complete.append(sdir)
+                del seen[sid]
+                if len(complete) >= n:
+                    break
+    print(f"[data] {shard}: {len(complete)} samples ready")
+    return complete[:n]
+
+
+class ShardDataset:
+    """Samples extracted from streamed shards (raw encoded bytes on disk, decoded lazily).
+    Intrinsics are identity — not shipped per-frame, and they don't affect depth metrics
+    or the distillation target (only the point cloud)."""
+
+    def __init__(self, sample_dirs: List[Path]):
+        self.dirs = sample_dirs
 
     def __len__(self) -> int:
-        return len(self.index)
+        return len(self.dirs)
 
     def __getitem__(self, i: int) -> Sample:
         import cv2
-        from huggingface_hub import hf_hub_download
-        rec = self.index[i]
+        d = self.dirs[i]
 
-        def get(path: str) -> str:
-            return hf_hub_download(DATASET_ID, path, repo_type="dataset", cache_dir=str(CACHE_DIR / "hf"))
+        def dec(name, flags):
+            return cv2.imdecode(np.frombuffer((d / name).read_bytes(), np.uint8), flags)
 
-        rgb = cv2.cvtColor(cv2.imread(get(rec["rgb"])), cv2.COLOR_BGR2RGB)
-        raw = _load_depth_png(Path(get(rec["raw"])))
-        gt = _load_depth_png(Path(get(rec["gt"])))
-        # intrinsics: many scenes ship a per-folder intrinsics.txt; fall back to None-safe identity
-        K = np.eye(3, dtype=np.float32)
-        intr_path = str(Path(rec["raw"]).parents[1] / "intrinsics.txt")
-        try:
-            K = np.array(np.loadtxt(get(intr_path)), dtype=np.float32)
-        except Exception:
-            warnings.warn(f"no intrinsics for {rec['key']}; using identity (point cloud invalid)")
-        return Sample(rgb=rgb, raw_depth=raw, intrinsics=K, gt_depth=gt,
-                      domain=rec["domain"], key=rec["key"])
+        rgb = cv2.cvtColor(dec("rgb", cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+        raw = np.nan_to_num(dec("raw", cv2.IMREAD_UNCHANGED).astype(np.float32) / 1000.0,
+                            nan=0.0, posinf=0.0, neginf=0.0)
+        gt = np.nan_to_num(dec("gt", cv2.IMREAD_UNCHANGED).astype(np.float32) / 1000.0,
+                           nan=0.0, posinf=0.0, neginf=0.0)
+        return Sample(rgb=rgb, raw_depth=raw, intrinsics=np.eye(3, dtype=np.float32),
+                      gt_depth=gt, domain=(d / "domain").read_text().strip(), key=d.name)
 
 
 def train_dataset(use_hf: bool = True):
     """The frozen training pool. `use_hf=False` -> local ./examples (smoke test)."""
     if not use_hf:
         return LocalExamplesDataset()
-    return HFStreamedDataset(_split()["train"])
+    dirs = (_stream_shard_samples(TRAIN_SIM_SHARD, N_TRAIN_SIM, "train_sim")
+            + _stream_shard_samples(TRAIN_REAL_SHARD, N_TRAIN_REAL, "train_real"))
+    return ShardDataset(dirs)
 
 
 def eval_dataset(use_hf: bool = True):
-    """The frozen eval set — the student's exam. Disjoint from the training pool.
-    `use_hf=False` -> local ./examples (smoke test)."""
+    """The frozen eval set — the student's exam. Streamed from DIFFERENT shards than the
+    training pool, so the two are disjoint. `use_hf=False` -> local ./examples."""
     if not use_hf:
         return LocalExamplesDataset()
-    return HFStreamedDataset(_split()["eval"])
+    dirs = (_stream_shard_samples(EVAL_SIM_SHARD, N_EVAL_SIM, "eval_sim")
+            + _stream_shard_samples(EVAL_REAL_SHARD, N_EVAL_REAL, "eval_real"))
+    return ShardDataset(dirs)
 
 
 # ----------------------------------------------------------------------------- #
@@ -538,6 +607,8 @@ def benchmark_latency(model: "torch.nn.Module", hw: Tuple[int, int] = BENCH_INPU
     alongside by evaluate(); latency is the primary metric."""
     dev = device()
     H, W = hw
+    # BATCH SIZE 1, ALWAYS: a real camera delivers one frame at a time, so per-frame
+    # latency is what deployment sees. Never batch the latency measurement.
     img = torch.rand(1, 3, H, W, device=dev, dtype=model.dtype if hasattr(model, "dtype") else torch.float32)
     depth = torch.rand(1, H, W, device=dev) * 3.0 + 0.5
     K = torch.tensor([[0.9, 0, 0.5], [0, 1.2, 0.5], [0, 0, 1]], device=dev, dtype=torch.float32)[None]
