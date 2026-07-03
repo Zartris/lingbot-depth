@@ -69,6 +69,21 @@ clearly wins, a **human** promotes it to a longer run by editing the frozen budg
 `prepare.py` (raise `TRAIN_MINUTES`, enlarge the data subset) — the agent never does
 this itself. This mirrors autoresearch's "rank cheaply on short runs, scale the winner".
 
+## Warm-start (weight inheritance across iterations)
+
+Each experiment warm-starts as a priority cascade (`WARM_START_FROM` in `train.py`,
+default `"best"`): `fresh stock-DINOv2 < teacher decoder < best student so far`, higher
+priority winning on name+shape overlap. This matters because the teacher's 1024-d
+encoder can't load into the 384-d student — so **only the best student can warm-start
+the student encoder**, the main thing distillation teaches; otherwise every run
+re-distills the encoder from scratch. When you change one layer, that layer falls
+through to teacher/fresh while everything else inherits from the best student.
+
+Consequence: the search is cumulative (evolutionary), so a recipe-only tweak can look
+good just from inheriting a fine-tuned parent. Set `WARM_START_FROM="teacher"` for a
+clean fixed-init A/B when you need to isolate a change, and validate promoted winners
+from a fixed init.
+
 ## Suggested idea backlog (roughly cheap→deep)
 
 1. **Fewer tokens** — lower `STUDENT_NUM_TOKENS_RANGE` / training `FEATURE_TOKENS`.

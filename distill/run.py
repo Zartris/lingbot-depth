@@ -61,23 +61,8 @@ def _eval_set(use_hf: bool):
 
 
 def find_best_student() -> "Path | None":
-    """Path to the best-scoring student.pt so far (min score in results.csv)."""
-    path = prepare.RUNS_DIR / "results.csv"
-    if not path.exists():
-        return None
-    best_row, best = None, float("inf")
-    with path.open() as f:
-        for r in csv.DictReader(f):
-            try:
-                s = float(r["score"])
-            except (KeyError, ValueError):
-                continue
-            if s < best:
-                best, best_row = s, r
-    if best_row is None:
-        return None
-    ckpt = prepare.RUNS_DIR / best_row["run_id"] / "student.pt"
-    return ckpt if ckpt.exists() else None
+    """Path to the best-scoring student.pt so far (delegates to the frozen helper)."""
+    return prepare.best_student_ckpt()
 
 
 def _print_level_table(rows: list) -> None:

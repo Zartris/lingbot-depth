@@ -65,6 +65,19 @@ LR = 2e-4
 WEIGHT_DECAY = 0.05
 BATCH_SIZE = 2
 WARM_START_DECODER = True  # copy teacher neck/heads into the student (big head start)
+# Where the student's initial weights come from, as a priority cascade (later wins on
+# name+shape overlap):  fresh(stock DINOv2) < teacher decoder < best student.
+#   "best"    -> inherit the best student so far (its distilled 384-d encoder + decoder),
+#                falling back to teacher decoder / fresh for anything that doesn't match.
+#                On iteration 1 (no best yet) this is identical to "teacher".
+#   "teacher" -> stock DINOv2 encoder + teacher decoder only (fixed init; clean A/B).
+#   "fresh"   -> stock DINOv2 encoder only, nothing from teacher/best.
+# NB: the teacher's 1024-d encoder never matches the student's 384-d encoder, so ONLY
+# "best" can warm-start the student encoder — otherwise it re-distills from scratch
+# every run. Downside of "best": the search becomes cumulative, so a recipe-only tweak
+# can look good just from inheriting a fine-tuned parent — use "teacher" for a clean
+# isolated test when that matters.
+WARM_START_FROM = "best"
 
 # NOTE: the training data pool, the eval set, and the compute budget
 # (TRAIN_MINUTES / MAX_STEPS) are FROZEN in distill/prepare.py — not here — so every
@@ -85,14 +98,17 @@ def build_student() -> "tuple[torch.nn.Module, dict]":
     forward/infer, output heads), not just the config here. The teacher's `mdm/model/`
     stays frozen.
 
-    Warm-start: encoder from stock DINOv2 (small) via init_weights() (strict=False, so
-    the depth-fusion patch embed inits fresh); decoder optionally copied from the
-    teacher (same config downstream of the encoder), which transfers most of the
-    refinement behaviour for free — the encoder is the main thing distillation teaches.
+    Warm-start is a priority cascade (see WARM_START_FROM), highest priority applied
+    last so it wins on name+shape overlap:
 
-    NB: each iteration warm-starts from this fixed init (stock DINOv2 + teacher decoder),
-    NOT from the best student so far — so every experiment gets equal compute from an
-    equal start, and architecture/code changes never hit a weight-shape mismatch.
+        fresh (stock DINOv2 encoder, via init_weights)
+          < teacher decoder (neck/heads copied where shapes match)
+            < best student so far (its distilled encoder + decoder, ALL matching tensors)
+
+    The teacher's 1024-d encoder can't load into the 384-d student, so best-student is
+    the only source that warm-starts the student encoder — which is the main thing
+    distillation teaches. On iteration 1 there is no best yet, so this reduces to the
+    fixed teacher-decoder init.
     """
     from distill.student_model.v2 import MDMModel as StudentMDMModel
 
@@ -101,21 +117,36 @@ def build_student() -> "tuple[torch.nn.Module, dict]":
         num_tokens_range=STUDENT_NUM_TOKENS_RANGE,
     )
     student = StudentMDMModel(**cfg).to(device())
-    student.init_weights()  # warm-start encoder from stock DINOv2
+    student.init_weights()  # base: encoder <- stock DINOv2, everything else fresh
 
-    if WARM_START_DECODER:
-        teacher = load_teacher()
-        _copy_matching(teacher, student, prefixes=("neck.", "depth_head.", "mask_head.", "scale_head."))
+    n_teacher = n_best = 0
+    if WARM_START_FROM in ("best", "teacher") and WARM_START_DECODER:
+        n_teacher = _copy_matching(
+            student, load_teacher().state_dict(),
+            prefixes=("neck.", "depth_head.", "mask_head.", "scale_head."))
+    if WARM_START_FROM == "best":
+        best = prepare.best_student_ckpt()
+        if best is not None:
+            best_sd = torch.load(best, map_location="cpu", weights_only=False)["model"]
+            n_best = _copy_matching(student, best_sd, prefixes=None)  # inherit ALL matching
+            print(f"[train] warm-start parent: {best}")
+    print(f"[train] warm-start: {n_teacher} tensors from teacher decoder, "
+          f"{n_best} from best student ({WARM_START_FROM})")
     return student, cfg
 
 
-def _copy_matching(src: torch.nn.Module, dst: torch.nn.Module, prefixes) -> int:
-    """Copy tensors from src->dst where name-prefixed and shapes match. Returns count."""
-    ssd, dsd = src.state_dict(), dst.state_dict()
+def _copy_matching(dst: torch.nn.Module, src_state: Dict[str, torch.Tensor],
+                   prefixes=None) -> int:
+    """Copy tensors from a source state_dict into dst where the name exists, the shape
+    matches, and (if `prefixes` is given) the name starts with one of them. Params with
+    no match are left untouched, so successive calls compose as a priority cascade.
+    Returns the number of tensors copied."""
+    dsd = dst.state_dict()
     n = 0
     for k, v in dsd.items():
-        if k in ssd and ssd[k].shape == v.shape and any(k.startswith(p) for p in prefixes):
-            dsd[k] = ssd[k].clone()
+        if k in src_state and src_state[k].shape == v.shape and (
+                prefixes is None or any(k.startswith(p) for p in prefixes)):
+            dsd[k] = src_state[k].clone()
             n += 1
     dst.load_state_dict(dsd, strict=False)
     return n

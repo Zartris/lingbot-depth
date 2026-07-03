@@ -27,6 +27,7 @@ Nothing here imports train.py; the dependency only goes the other way.
 from __future__ import annotations
 
 import copy
+import csv
 import json
 import time
 import warnings
@@ -634,6 +635,30 @@ def load_baseline() -> Optional[Baseline]:
     if p.exists():
         return Baseline(**json.loads(p.read_text()))
     return None
+
+
+def best_student_ckpt() -> Optional[Path]:
+    """Path to the best-scoring student.pt so far (min `score` in results.csv), or None.
+
+    Reads the frozen metric's log, so it lives here rather than in the mutable files.
+    Used both for the teacher/best/current comparison and as the default warm-start
+    parent for the next experiment (train.build_student)."""
+    path = RUNS_DIR / "results.csv"
+    if not path.exists():
+        return None
+    best_row, best = None, float("inf")
+    with path.open() as f:
+        for r in csv.DictReader(f):
+            try:
+                s = float(r["score"])
+            except (KeyError, ValueError):
+                continue
+            if s < best:
+                best, best_row = s, r
+    if best_row is None:
+        return None
+    ckpt = RUNS_DIR / best_row["run_id"] / "student.pt"
+    return ckpt if ckpt.exists() else None
 
 
 # ----------------------------------------------------------------------------- #
