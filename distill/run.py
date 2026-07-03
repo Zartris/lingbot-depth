@@ -65,11 +65,20 @@ def _append_result(row: dict) -> None:
 
 def setup_baseline(use_hf: bool) -> None:
     print("[run] measuring teacher baseline (accuracy + latency) ...")
-    base = prepare.measure_teacher_baseline(_eval_set(use_hf))
-    print(f"[run] teacher: latency={base.latency_ms:.1f}ms  "
+    eval_set = _eval_set(use_hf)
+    base = prepare.measure_teacher_baseline(eval_set)
+    print(f"[run] teacher @ L{prepare.BENCH_RESOLUTION_LEVEL}: latency={base.latency_ms:.1f}ms  "
           f"absrel_real={base.absrel_real:.4f}  delta1_real={base.delta1_real:.3f}  "
           f"params={base.params/1e6:.1f}M")
-    print(f"[run] wrote {prepare.RUNS_DIR/'teacher_baseline.json'}")
+
+    print("[run] teacher latency-vs-accuracy across resolution_level (free speed lever):")
+    rows = prepare.teacher_resolution_report(eval_set)
+    print(f"      {'level':>5} {'latency_ms':>11} {'absrel_w':>9} {'delta1_w':>9}")
+    for r in rows:
+        print(f"      {r['resolution_level']:>5} {r['latency_ms']:>11.1f} "
+              f"{r['absrel_weighted']:>9.4f} {r['delta1_weighted']:>9.4f}")
+    print(f"[run] wrote {prepare.RUNS_DIR/'teacher_baseline.json'} and "
+          f"{prepare.RUNS_DIR/'teacher_resolution_sweep.json'}")
 
 
 def one_iteration(accept: bool, use_hf: bool) -> dict:

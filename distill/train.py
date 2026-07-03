@@ -147,8 +147,14 @@ def distill_step(student, teacher, batch, dev) -> Dict[str, torch.Tensor]:
     imgs, raws, Ks, samples = batch
     B = imgs.shape[0]
 
-    # Teacher targets (no grad). In a full run these are precomputed & cached by
-    # prepare.cache_teacher_targets(); here we compute inline for simplicity.
+    # Teacher targets (no grad). In a full run these are precomputed & cached once;
+    # here we compute inline for simplicity.
+    #   - features are taken at FEATURE_TOKENS so the grid matches the student's for
+    #     feature distillation;
+    #   - the output-depth target is the teacher's BEST quality (infer() defaults to
+    #     resolution_level=9, i.e. max tokens) so the student learns to reproduce the
+    #     teacher's best output while running at its own smaller token budget. This is
+    #     a deliberate operating-point choice — change it if you want a cheaper target.
     with torch.no_grad():
         t_feat, t_cls = teacher.infer_feat(imgs, depth_in=raws, num_tokens=FEATURE_TOKENS)
         t_out = teacher.infer(imgs, depth_in=raws, intrinsics=Ks, apply_mask=False)

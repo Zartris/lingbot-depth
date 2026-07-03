@@ -69,7 +69,13 @@ this itself. This mirrors autoresearch's "rank cheaply on short runs, scale the 
 ## Suggested idea backlog (roughly cheap→deep)
 
 1. **Fewer tokens** — lower `STUDENT_NUM_TOKENS_RANGE` / training `FEATURE_TOKENS`.
-   The encoder cost is ~linear-to-quadratic in token count; this is the fastest lever.
+   Token count is THE dominant cost (measured on the teacher, RTX2080ti: L0~128ms →
+   L9~307ms, a 2.4x range) and it's independent of input image resolution — the model
+   interpolates to a token grid set by `resolution_level` and aspect ratio. Only tiny
+   details are lost when lowering it (e.g. thin fence wires). `STUDENT_NUM_TOKENS_RANGE`
+   is the student's `resolution_level` mapping, so this is the fastest lever by far.
+   NB: `setup-baseline` prints the teacher's own level sweep — the student needs to beat
+   that curve, not just the slow level-9 point.
 2. **Smaller backbone** — `dinov2_vits14` (384-d, 12 layers) vs teacher L (1024, 24).
    Lean hard on feature + decoder warm-start to recover accuracy.
 3. **Fewer `intermediate_layers`** taken from the backbone.

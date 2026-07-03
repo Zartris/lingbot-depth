@@ -74,7 +74,14 @@ MAX_DEPTH = 10.0
 BENCH_INPUT_HW = (480, 640)   # fixed input size so latency numbers are comparable
 BENCH_WARMUP = 10
 BENCH_ITERS = 50
-BENCH_RESOLUTION_LEVEL = 9    # matches model.infer default
+# resolution_level (0-9) scales the token grid in the model's pre-processing and
+# DOMINATES latency (measured on an RTX2080ti: L0~128ms, L3~150ms, L6~216ms, L9~307ms),
+# while the input image resolution does NOT affect it. Latency and accuracy are always
+# read at the SAME level (BENCH_RESOLUTION_LEVEL) so they describe one operating point.
+BENCH_RESOLUTION_LEVEL = 9    # the operating point the score is computed at
+# Reported once for the teacher to expose its latency-vs-accuracy Pareto curve — the
+# curve the student ultimately has to beat (lowering the teacher's level is ~free speed).
+RESOLUTION_SWEEP = [0, 3, 6, 9]
 
 # ---- Dataset subset (FROZEN) -------------------------------------------------
 # The same training pool and the same eval set for EVERY experiment. Frozen here so
@@ -406,11 +413,15 @@ def count_params(model: "torch.nn.Module") -> int:
 
 
 @torch.inference_mode()
-def benchmark_latency(model: "torch.nn.Module", hw: Tuple[int, int] = BENCH_INPUT_HW) -> float:
-    """Median forward latency in ms for one frame at a fixed resolution.
+def benchmark_latency(model: "torch.nn.Module", hw: Tuple[int, int] = BENCH_INPUT_HW,
+                      resolution_level: int = BENCH_RESOLUTION_LEVEL) -> float:
+    """Median forward latency in ms for one frame at a given resolution_level.
 
-    Measures the real `infer()` path (encoder dominates). Portable secondary signals
-    (params, FLOPs) are reported alongside by evaluate(); latency is the primary."""
+    Measures the real `infer()` path (the token-grid pre-processing + encoder, which
+    dominate). Note `hw` barely affects latency — the model interpolates to a token
+    grid set by resolution_level and aspect ratio — but the aspect ratio does matter,
+    so keep it representative. Portable secondary signals (params/FLOPs) are reported
+    alongside by evaluate(); latency is the primary metric."""
     dev = device()
     H, W = hw
     img = torch.rand(1, 3, H, W, device=dev, dtype=model.dtype if hasattr(model, "dtype") else torch.float32)
@@ -418,7 +429,7 @@ def benchmark_latency(model: "torch.nn.Module", hw: Tuple[int, int] = BENCH_INPU
     K = torch.tensor([[0.9, 0, 0.5], [0, 1.2, 0.5], [0, 0, 1]], device=dev, dtype=torch.float32)[None]
 
     def one():
-        model.infer(img, depth_in=depth, intrinsics=K, resolution_level=BENCH_RESOLUTION_LEVEL)
+        model.infer(img, depth_in=depth, intrinsics=K, resolution_level=resolution_level)
 
     for _ in range(BENCH_WARMUP):
         one()
@@ -475,8 +486,10 @@ def objective(latency_ms: float, acc: Dict[str, float], base: Baseline) -> float
 # ----------------------------------------------------------------------------- #
 
 @torch.inference_mode()
-def _predict(model: "torch.nn.Module", s: Sample) -> np.ndarray:
-    """Run a model's infer() on one Sample, return refined depth as (H, W) float32."""
+def _predict(model: "torch.nn.Module", s: Sample,
+             resolution_level: int = BENCH_RESOLUTION_LEVEL) -> np.ndarray:
+    """Run a model's infer() on one Sample at `resolution_level`; return refined depth
+    as (H, W) float32. The accuracy path uses the SAME level the latency is timed at."""
     dev = device()
     H, W = s.rgb.shape[:2]
     img = torch.tensor(s.rgb / 255.0, dtype=torch.float32, device=dev).permute(2, 0, 1)[None]
@@ -485,26 +498,30 @@ def _predict(model: "torch.nn.Module", s: Sample) -> np.ndarray:
     K[0] /= W
     K[1] /= H
     K = torch.tensor(K, device=dev)[None]
-    out = model.infer(img, depth_in=depth, intrinsics=K)
+    out = model.infer(img, depth_in=depth, intrinsics=K, resolution_level=resolution_level)
     return out["depth"].squeeze().float().cpu().numpy()
 
 
 def evaluate(model: "torch.nn.Module", eval_set, base: Optional[Baseline] = None,
-             teacher: Optional["torch.nn.Module"] = None) -> Dict[str, float]:
-    """Score a model on the frozen eval set. Returns latency, per-domain accuracy,
-    and (if a baseline is given) the single objective `score`.
+             teacher: Optional["torch.nn.Module"] = None,
+             resolution_level: int = BENCH_RESOLUTION_LEVEL) -> Dict[str, float]:
+    """Score a model on the frozen eval set at a given operating point. Returns latency
+    + per-domain accuracy (both measured at `resolution_level`) and, if a baseline is
+    given, the single objective `score`.
 
-    If a sample has no gt_depth (e.g. the local smoke set), the teacher's prediction
-    is used as the reference so the harness still produces a fidelity signal."""
+    If a sample has no gt_depth (e.g. the local smoke set), the teacher's BEST-quality
+    prediction (level 9) is used as the reference so the harness still produces a
+    fidelity signal — the reference is always the best teacher, independent of the
+    level the model under test runs at."""
     per_domain: Dict[str, List[Dict[str, float]]] = {"real": [], "sim": []}
     for i in range(len(eval_set)):
         s = eval_set[i]
-        pred = _predict(model, s)
+        pred = _predict(model, s, resolution_level=resolution_level)
         gt = s.gt_depth
         if gt is None:
             if teacher is None:
                 teacher = load_teacher()
-            gt = _predict(teacher, s)
+            gt = _predict(teacher, s, resolution_level=9)  # reference = best teacher
             gt = np.where(np.isfinite(gt), gt, 0.0)
         m = depth_metrics(pred, gt)
         m.update(completion_metrics(pred, gt, s.raw_depth))
@@ -523,7 +540,7 @@ def evaluate(model: "torch.nn.Module", eval_set, base: Optional[Baseline] = None
     absrel_w = wr * real.get("absrel", np.nan) + ws * sim.get("absrel", np.nan)
     delta1_w = wr * real.get("delta1", np.nan) + ws * sim.get("delta1", np.nan)
 
-    latency = benchmark_latency(model)
+    latency = benchmark_latency(model, resolution_level=resolution_level)
     result: Dict[str, float] = {
         "latency_ms": latency,
         "params": count_params(model),
@@ -553,6 +570,27 @@ def measure_teacher_baseline(eval_set, teacher: Optional["torch.nn.Module"] = No
     )
     (RUNS_DIR / "teacher_baseline.json").write_text(json.dumps(asdict(base), indent=2))
     return base
+
+
+def teacher_resolution_report(eval_set, teacher: Optional["torch.nn.Module"] = None,
+                              levels: List[int] = RESOLUTION_SWEEP) -> List[Dict[str, float]]:
+    """Measure the teacher's latency + accuracy across resolution_levels — its
+    latency-vs-accuracy Pareto curve. This is pure telemetry (it does NOT change the
+    objective): it shows how much speed the teacher can buy for free by lowering the
+    level, so the student's speedup can be read against a fairly-tuned teacher rather
+    than the slowest (level-9) point. Saved to runs/teacher_resolution_sweep.json."""
+    teacher = teacher or load_teacher()
+    rows: List[Dict[str, float]] = []
+    for lvl in levels:
+        r = evaluate(teacher, eval_set, base=None, teacher=teacher, resolution_level=lvl)
+        rows.append({
+            "resolution_level": lvl,
+            "latency_ms": round(r["latency_ms"], 3),
+            "absrel_weighted": round(r["absrel_weighted"], 5),
+            "delta1_weighted": round(r["delta1_weighted"], 5),
+        })
+    (RUNS_DIR / "teacher_resolution_sweep.json").write_text(json.dumps(rows, indent=2))
+    return rows
 
 
 def load_baseline() -> Optional[Baseline]:
