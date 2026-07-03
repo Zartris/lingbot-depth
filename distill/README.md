@@ -26,6 +26,15 @@ Latency = median single-frame forward on this GPU. Accuracy = AbsRel/δ1 vs
 ground-truth depth, weighted `0.7*real + 0.3*sim` (deployment is a real sensor; sim
 is a clean-GT cross-check). Params/FLOPs are logged as portability signals.
 
+## Environment
+
+**xformers is required** — the RGB-D encoder's nested-tensor path (`block.py`) hard-asserts
+it; it is not an optional acceleration. Match xformers to your torch/GPU.
+
+Verified working end-to-end on an **NVIDIA RTX PRO 4000 Blackwell (sm_120)**:
+`torch 2.11.0+cu128` + `xformers 0.0.35`. Note the repo's pinned `torch==2.6.0` /
+`xformers==0.0.29.post2` predate Blackwell and won't run on it — use a cu128 torch there.
+
 ## Quick start
 
 ```bash
