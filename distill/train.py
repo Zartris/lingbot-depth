@@ -7,15 +7,18 @@ faster on our GPU while staying within the accuracy band defined in prepare.py.
 
 What you (the agent) may change here, freely:
   * STUDENT_CONFIG / build_student() — backbone size, intermediate_layers,
-    num_tokens_range, neck & head widths, or an entirely custom student module
-    (token merging/pruning, lightweight decoder, ...).
+    num_tokens_range, neck & head widths.
   * The distillation recipe — which losses (output / feature / gt), their weights,
     optimizer, LR schedule, augmentations, batch size, steps.
   * Anything else in THIS file.
+  * distill/student_model/ — the MUTABLE copy of the model stack. Edit the network
+    itself here (attention, patch embed, blocks, forward/infer, output heads, token
+    merging/pruning, ...). Keep the infer() contract below.
 
 What you may NOT change:
   * distill/prepare.py (data, teacher, metrics, latency, objective) — frozen.
-  * the mdm/ package (defines the frozen teacher) — frozen.
+  * the mdm/ package (defines the frozen teacher) — frozen. Editing it would change
+    the teacher too and corrupt the targets + eval reference. Use distill/student_model/.
   * The contract: whatever build_student() returns MUST expose
         infer(image, depth_in=..., intrinsics=...) -> {"depth", "points", "mask"}
     with the same tensor shapes as the teacher, so prepare.evaluate() can score it.
@@ -74,27 +77,36 @@ WARM_START_DECODER = True  # copy teacher neck/heads into the student (big head 
 #  Student                                                                      #
 # --------------------------------------------------------------------------- #
 
-def build_student() -> torch.nn.Module:
-    """Instantiate the student and warm-start it.
+def build_student() -> "tuple[torch.nn.Module, dict]":
+    """Instantiate the student and warm-start it. Returns (model, config).
 
-    Encoder: stock DINOv2 (small) pretrained weights via init_weights() (strict=False,
-    so the depth-fusion patch embed inits fresh).  Decoder: optionally copied from the
+    The student is the MUTABLE copy of the model stack in `distill/student_model/` —
+    edit that tree to change the network itself (attention, patch embed, blocks,
+    forward/infer, output heads), not just the config here. The teacher's `mdm/model/`
+    stays frozen.
+
+    Warm-start: encoder from stock DINOv2 (small) via init_weights() (strict=False, so
+    the depth-fusion patch embed inits fresh); decoder optionally copied from the
     teacher (same config downstream of the encoder), which transfers most of the
     refinement behaviour for free — the encoder is the main thing distillation teaches.
+
+    NB: each iteration warm-starts from this fixed init (stock DINOv2 + teacher decoder),
+    NOT from the best student so far — so every experiment gets equal compute from an
+    equal start, and architecture/code changes never hit a weight-shape mismatch.
     """
-    from mdm.model.v2 import MDMModel
+    from distill.student_model.v2 import MDMModel as StudentMDMModel
 
     cfg = derive_student_config(
         backbone=STUDENT_BACKBONE,
         num_tokens_range=STUDENT_NUM_TOKENS_RANGE,
     )
-    student = MDMModel(**cfg).to(device())
+    student = StudentMDMModel(**cfg).to(device())
     student.init_weights()  # warm-start encoder from stock DINOv2
 
     if WARM_START_DECODER:
         teacher = load_teacher()
         _copy_matching(teacher, student, prefixes=("neck.", "depth_head.", "mask_head.", "scale_head."))
-    return student
+    return student, cfg
 
 
 def _copy_matching(src: torch.nn.Module, dst: torch.nn.Module, prefixes) -> int:
@@ -214,7 +226,7 @@ def main(run_dir: Path, use_hf: bool = False) -> Path:
     print(f"[train] device={dev} backbone={STUDENT_BACKBONE} tokens={STUDENT_NUM_TOKENS_RANGE}")
 
     teacher = load_teacher()
-    student = build_student()
+    student, student_cfg = build_student()
     student.train()
 
     train_set = prepare.train_dataset(use_hf=use_hf)   # FROZEN pool (see prepare.py)
@@ -244,6 +256,7 @@ def main(run_dir: Path, use_hf: bool = False) -> Path:
     ckpt_path = run_dir / "student.pt"
     torch.save({
         "model": student.state_dict(),
+        "student_config": student_cfg,          # rebuild exactly, without re-deriving
         "student_backbone": STUDENT_BACKBONE,
         "num_tokens_range": STUDENT_NUM_TOKENS_RANGE,
         "steps": step,

@@ -29,12 +29,15 @@ wins that also cut params/FLOPs, since those port across hardware.
 
 ## Rules — what you may and may not touch
 
-**You may edit only `distill/train.py`.** Inside it, anything goes:
-- Student architecture — `STUDENT_BACKBONE` (`dinov2_vits14` / `vitb14`),
-  `intermediate_layers`, `STUDENT_NUM_TOKENS_RANGE`, neck/head widths, or a custom
-  lightweight student module (token merging/pruning, distilled decoder, ...).
-- Distillation recipe — loss terms & weights (`W_OUTPUT_DISTILL`, `W_FEATURE_DISTILL`,
+**You may edit `distill/train.py` and `distill/student_model/`.**
+- `distill/train.py` — student config + the distillation recipe: `STUDENT_BACKBONE`
+  (`dinov2_vits14` / `vitb14`), `intermediate_layers`, `STUDENT_NUM_TOKENS_RANGE`,
+  neck/head widths; loss terms & weights (`W_OUTPUT_DISTILL`, `W_FEATURE_DISTILL`,
   `W_GT`), optimiser, LR schedule, augmentations, `BATCH_SIZE`, sampling/curriculum.
+- `distill/student_model/` — the MUTABLE copy of the model stack (its own `v2.py`,
+  encoder, decoder, `dinov2_rgbd/`). Edit the network ITSELF here: attention, patch
+  embed, block structure, `forward`/`infer`, output heads, token merging/pruning,
+  structural pruning, fused ops. This is where code-level speedups live.
 
 **You may NOT touch** (they define the problem and keep the score honest):
 - `distill/prepare.py` — data, teacher, metrics, latency, objective. Frozen. This

@@ -36,16 +36,21 @@ from distill import prepare  # noqa: E402
 
 
 def _load_student(ckpt_path: Path):
-    """Rebuild a student from a saved checkpoint (uses train.build_student's config)."""
+    """Rebuild a student from a saved checkpoint using the MUTABLE student model stack.
+
+    Uses the config stored in the checkpoint (falls back to re-deriving it). NB: the
+    reconstruction uses the CURRENT distill/student_model/ code — a checkpoint saved
+    under a since-changed student architecture may not load cleanly; that's expected
+    (compare against the best student before editing the student net, or re-run it)."""
     import torch
-    from mdm.model.v2 import MDMModel
+    from distill.student_model.v2 import MDMModel as StudentMDMModel
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    cfg = prepare.derive_student_config(
+    cfg = ckpt.get("student_config") or prepare.derive_student_config(
         backbone=ckpt["student_backbone"],
         num_tokens_range=ckpt.get("num_tokens_range"),
     )
-    model = MDMModel(**cfg).to(prepare.device())
+    model = StudentMDMModel(**cfg).to(prepare.device())
     model.load_state_dict(ckpt["model"], strict=False)
     return model.eval()
 
@@ -188,7 +193,8 @@ def _git_commit(run_id: str, res: dict) -> None:
     msg = (f"distill: accept {run_id} "
            f"(score={res['score']:.1f}, {res.get('speedup_vs_teacher',0):.2f}x, "
            f"absrel_w={res['absrel_weighted']:.4f})")
-    subprocess.run(["git", "add", "distill/train.py", "distill/runs/results.csv"], cwd=prepare.REPO_ROOT)
+    subprocess.run(["git", "add", "distill/train.py", "distill/student_model",
+                    "distill/runs/results.csv"], cwd=prepare.REPO_ROOT)
     subprocess.run(["git", "commit", "-m", msg], cwd=prepare.REPO_ROOT)
     print(f"[run] committed: {msg}")
 
