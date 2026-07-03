@@ -1,0 +1,2 @@
+# Champion student weights travel via LFS (bounded to one file, overwritten on promote).
+distill/best/student.pt filter=lfs diff=lfs merge=lfs -text

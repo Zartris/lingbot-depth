@@ -186,7 +186,7 @@ def _log_l1(pred, target, valid):
     return (F.l1_loss(p, t, reduction="none") * valid).sum() / valid.sum().clamp_min(1)
 
 
-def distill_step(student, teacher, batch, dev) -> Dict[str, torch.Tensor]:
+def distill_step(student, teacher, batch, dev, feat_proj=None) -> Dict[str, torch.Tensor]:
     imgs, raws, Ks, samples = batch
     B = imgs.shape[0]
 
@@ -211,10 +211,15 @@ def distill_step(student, teacher, batch, dev) -> Dict[str, torch.Tensor]:
 
     losses: Dict[str, torch.Tensor] = {}
 
-    # Feature distillation — student & teacher encoder features share dim_out, so we
-    # match them directly (cosine + L2). This is the main lever for keeping accuracy.
+    # Feature distillation — the main lever for keeping accuracy. The student encoder
+    # emits `dim_out` channels (e.g. 384 for ViT-S) and the teacher a different count
+    # (1024 for ViT-L), so a learnable 1x1 projector (feat_proj) maps the student
+    # features up to the teacher's channel dim before matching (cosine + L2). The
+    # projector is a training-only helper — it is NOT part of the student at inference.
     if W_FEATURE_DISTILL > 0:
         sf, tf = s_feat.float(), t_feat.float()
+        if feat_proj is not None:
+            sf = feat_proj(sf)
         if sf.shape[-2:] != tf.shape[-2:]:
             sf = F.interpolate(sf, tf.shape[-2:], mode="bilinear", align_corners=False)
         cos = 1 - F.cosine_similarity(sf, tf, dim=1).mean()
@@ -264,8 +269,19 @@ def main(run_dir: Path, use_hf: bool = False) -> Path:
     n = len(train_set)
     print(f"[train] {n} training samples ({'HF stream' if use_hf else 'local examples'})")
 
-    opt = torch.optim.AdamW(
-        [p for p in student.parameters() if p.requires_grad], lr=LR, weight_decay=WEIGHT_DECAY)
+    # Feature-distillation projector: student dim_out -> teacher dim_out (training-only).
+    feat_proj = None
+    if W_FEATURE_DISTILL > 0:
+        s_dim = student.encoder.output_projections[0].out_channels
+        t_dim = teacher.encoder.output_projections[0].out_channels
+        if s_dim != t_dim:
+            feat_proj = torch.nn.Conv2d(s_dim, t_dim, kernel_size=1).to(dev)
+            print(f"[train] feature-distill projector: {s_dim} -> {t_dim}")
+
+    params = [p for p in student.parameters() if p.requires_grad]
+    if feat_proj is not None:
+        params += list(feat_proj.parameters())
+    opt = torch.optim.AdamW(params, lr=LR, weight_decay=WEIGHT_DECAY)
 
     rng = np.random.default_rng(prepare.SEED)
     t_start = time.time()
@@ -273,10 +289,10 @@ def main(run_dir: Path, use_hf: bool = False) -> Path:
     while (time.time() - t_start) < prepare.TRAIN_MINUTES * 60 and step < prepare.MAX_STEPS:
         idx = rng.integers(0, n, size=BATCH_SIZE)
         batch = _to_batch([train_set[int(i)] for i in idx], dev)
-        losses = distill_step(student, teacher, batch, dev)
+        losses = distill_step(student, teacher, batch, dev, feat_proj=feat_proj)
         opt.zero_grad(set_to_none=True)
         losses["total"].backward()
-        torch.nn.utils.clip_grad_norm_([p for p in student.parameters() if p.requires_grad], 1.0)
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
         if step % 20 == 0:
             msg = " ".join(f"{k}={v.item():.4f}" for k, v in losses.items())

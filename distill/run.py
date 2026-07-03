@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import subprocess
 import sys
 import time
@@ -176,8 +177,44 @@ def one_iteration(accept: bool, use_hf: bool) -> dict:
           f"(best-so-far={prev_best:.2f})")
 
     if accept and improved:
+        promote_best(run_id, res)     # copy champion into the committed distill/best/
         _git_commit(run_id, res)
     return res
+
+
+def promote_best(run_id: str, res: dict) -> None:
+    """Copy the winning run's weights + code snapshot + metadata into the committed
+    distill/best/, so the champion travels across machines (weights via LFS)."""
+    import shutil
+    import torch
+    from distill import train
+
+    src = prepare.RUNS_DIR / run_id
+    dst = prepare.BEST_DIR
+    if dst.exists():
+        shutil.rmtree(dst)
+    dst.mkdir(parents=True)
+
+    shutil.copy2(src / "student.pt", dst / "student.pt")
+    ck = torch.load(src / "student.pt", map_location="cpu", weights_only=False)
+    snap = ck.get("snapshot_pkg")
+    if snap and (src / snap).exists():
+        shutil.copytree(src / snap, dst / snap,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+
+    try:
+        sha = subprocess.check_output(["git", "rev-parse", "HEAD"],
+                                      cwd=prepare.REPO_ROOT).decode().strip()
+    except Exception:
+        sha = None
+    gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+    meta = {"run_id": run_id, "gpu": gpu, "git_sha": sha,
+            "backbone": train.STUDENT_BACKBONE, "tokens": str(train.STUDENT_NUM_TOKENS_RANGE),
+            **{k: (round(v, 5) if isinstance(v, float) else v) for k, v in res.items()}}
+    (dst / "best.json").write_text(json.dumps(meta, indent=2))
+    subprocess.run(["git", "add", "distill/best", ".gitattributes"], cwd=prepare.REPO_ROOT)
+    print(f"[run] promoted {run_id} -> distill/best/  (score={res.get('score', float('nan')):.2f}, "
+          f"gpu={gpu})  — scores are machine-specific; re-benchmark on other machines")
 
 
 def _best_score_excluding(run_id: str) -> float:

@@ -12,7 +12,8 @@ agent loop in the style of [karpathy/autoresearch](https://github.com/karpathy/a
 | `train.py` | **agent edits this** | Student config + distillation recipe + training loop. |
 | `run.py` | runner | `train → eval → log → keep/revert`. |
 | `program.md` | steering | The agent's rules, the metric, the idea backlog. |
-| `runs/` | output | Per-experiment `student.pt` + a copy of the student **code snapshot** (so a past student rebuilds exactly even after the live code changes), plus `results.csv`, `teacher_baseline.json`. |
+| `runs/` | output (git-ignored) | Per-experiment `student.pt` + a copy of the student **code snapshot** (so a past student rebuilds exactly even after the live code changes), plus `results.csv`, `teacher_baseline.json`. |
+| `best/` | **committed** | The champion that travels across machines: `student.pt` (weights, via **Git LFS**), its code snapshot, and `best.json` (score, metrics, config, `gpu`, `git_sha`). Updated + committed on each accepted improvement (`--accept`). |
 | `.cache/` | output | Downloaded dataset frames + cached teacher targets. |
 
 ## The metric (one number, lower is better)
@@ -59,6 +60,17 @@ the single spot that may need a one-line tweak.
 
 Without `--hf`, the harness runs on the 8 bundled `../examples` scenes (no GT, so it
 scores fidelity-to-teacher) — enough to validate all plumbing before committing GPU time.
+
+## Champion & cross-machine notes
+
+Accepted winners are promoted to the committed `best/` (weights via Git LFS) so the
+team's best student travels with the repo. Collaborators need `git lfs install` once.
+
+⚠️ **Scores are machine-specific.** Latency (and thus `score`/`speedup`) depend on the
+GPU, so `best.json` records the `gpu` it was measured on. Keep-or-revert **ranking**
+stays local (`runs/results.csv`, one machine); the committed champion is a portable
+warm-start + comparison artifact, not a cross-machine score to rank against. On a new
+machine, re-benchmark the champion locally (`--compare`) to get comparable numbers.
 
 ## What the student is
 

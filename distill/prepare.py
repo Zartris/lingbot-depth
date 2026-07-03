@@ -44,7 +44,8 @@ import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CACHE_DIR = REPO_ROOT / "distill" / ".cache"        # teacher targets, downloaded frames
-RUNS_DIR = REPO_ROOT / "distill" / "runs"           # per-experiment ckpts + results
+RUNS_DIR = REPO_ROOT / "distill" / "runs"           # per-experiment ckpts + results (local)
+BEST_DIR = REPO_ROOT / "distill" / "best"           # committed champion (travels via git/LFS)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -638,27 +639,31 @@ def load_baseline() -> Optional[Baseline]:
 
 
 def best_student_ckpt() -> Optional[Path]:
-    """Path to the best-scoring student.pt so far (min `score` in results.csv), or None.
+    """Path to the best student checkpoint to use as warm-start / comparison parent.
 
-    Reads the frozen metric's log, so it lives here rather than in the mutable files.
-    Used both for the teacher/best/current comparison and as the default warm-start
-    parent for the next experiment (train.build_student)."""
+    Prefers the best LOCAL run (min `score` in results.csv) because those scores were
+    measured on THIS machine and are directly comparable. Falls back to the committed
+    champion in distill/best/ (which seeds a fresh clone and lets the team's best
+    student travel across machines). Ranking/keep-revert stays machine-local; the
+    committed champion is a portable warm-start + comparison artifact, not a
+    cross-machine score to rank against (latency is machine-specific — see best.json)."""
     path = RUNS_DIR / "results.csv"
-    if not path.exists():
-        return None
-    best_row, best = None, float("inf")
-    with path.open() as f:
-        for r in csv.DictReader(f):
-            try:
-                s = float(r["score"])
-            except (KeyError, ValueError):
-                continue
-            if s < best:
-                best, best_row = s, r
-    if best_row is None:
-        return None
-    ckpt = RUNS_DIR / best_row["run_id"] / "student.pt"
-    return ckpt if ckpt.exists() else None
+    if path.exists():
+        best_row, best = None, float("inf")
+        with path.open() as f:
+            for r in csv.DictReader(f):
+                try:
+                    s = float(r["score"])
+                except (KeyError, ValueError):
+                    continue
+                if s < best:
+                    best, best_row = s, r
+        if best_row is not None:
+            ckpt = RUNS_DIR / best_row["run_id"] / "student.pt"
+            if ckpt.exists():
+                return ckpt
+    committed = BEST_DIR / "student.pt"     # portable champion (fresh clone / cross-machine)
+    return committed if committed.exists() else None
 
 
 # ----------------------------------------------------------------------------- #
