@@ -53,14 +53,17 @@ be streamed per camera before the first triplet completes.
    streaming). Confirm before enabling real.
 2. The `_rmd2c.png` = "raw depth" mapping for sim-train is inferred by elimination.
 
-## Last validated (this session)
+## Last validated
 
-`python -m distill.run --setup-baseline --hf` **completed successfully** (exit 0):
-streamed 100 RobbySimVal samples from the 47 GB shard and measured the teacher
-baseline — `latency=402 ms @ L9, params=321.2M` (real metrics `nan` because real is
-off by default; sim metrics are in `runs/teacher_baseline.json`). So the streamed-HF
-eval path works end-to-end. `runs/` is git-ignored, so the baseline JSON stays local —
-re-run `--setup-baseline --hf` next session to regenerate it (fast; samples are cached).
+- `--setup-baseline --hf` (exit 0): streamed 100 RobbySimVal samples, teacher baseline
+  `latency=402 ms @ L9, 321.2M params`. Streamed-HF **eval** path works.
+- `--test-run --hf` (exit 0): streamed 1200 RobbySim train samples, ran 6 real training
+  steps with all three losses active incl. **GT loss** (`feat/out/gt`), saved+snapshotted,
+  reloaded, scored (37.2M params, 4.48× faster than teacher). Streamed-HF **train+eval
+  together** works — the full loop is validated end-to-end on real data. (Accuracy is
+  noise: 6 steps is plumbing, not training.)
+
+`runs/` is git-ignored so these JSONs stay local; re-run to regenerate (fast, cached).
 
 ## Next steps, in order
 
@@ -75,10 +78,21 @@ re-run `--setup-baseline --hf` next session to regenerate it (fast; samples are 
 5. Hand to auto-research: the agent edits `train.py` / `student_model/`, loop with
    `--hf --accept`.
 
+## Ready for auto-research? Almost — two things unproven
+
+The plumbing is fully validated end-to-end on real streamed data, so the loop can run.
+Two substantive unknowns remain (best closed with ONE real `--hf` iteration, ~20 min):
+
+1. **Does distillation actually converge?** We've only run 6-step plumbing; that the
+   student's score *improves* with a real budget is unproven (it's what the research
+   loop explores, but confirm the machinery produces a real gain first).
+2. **The `--accept` → `promote_best` → committed-champion path** has only been dry-run
+   tested, and the warm-start cascade's best-inheritance hasn't run across 2 real
+   iterations (run 1 had "0 from best" — no champion yet).
+
 ## Known gaps / watch-list
 
-- **Nothing has run a full real iteration yet** — only `--test-run` (6 steps). Real
-  training numbers are unproven.
+- Real (RobbyReal) domain is off by default; dir names unverified (see above).
 - **Cross-machine scores aren't comparable** (latency is GPU-specific). Ranking stays
   machine-local (`runs/results.csv`); the committed champion (`distill/best/`, fp16,
   no LFS) records its `gpu` in `best.json` — re-benchmark it locally elsewhere.
