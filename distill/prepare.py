@@ -520,8 +520,13 @@ def teacher_targets(samples: List[Sample], feature_tokens: int, teacher, dev):
 
     if miss:
         mi, mr, mk = imgs[miss], raws[miss], Ks[miss]
+        # BOTH targets computed at `feature_tokens` — the SAME operating point the student
+        # trains at — so the target is self-consistent. (Using the teacher's default level
+        # here would ask the student to match a different-token-count output, which
+        # destabilises even a teacher-initialised student.)
         tf, _ = teacher.infer_feat(mi, depth_in=mr, num_tokens=feature_tokens)
-        td = teacher.infer(mi, depth_in=mr, intrinsics=mk, apply_mask=False)["depth"]
+        td = teacher.infer(mi, depth_in=mr, intrinsics=mk, apply_mask=False,
+                           num_tokens=feature_tokens)["depth"]
         for j, i in enumerate(miss):
             depths[i] = td[j]
             feats[i] = tf[j]     # use the freshly computed feature (avoid recompute below)

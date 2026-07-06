@@ -23,9 +23,19 @@ student. Full detail is in `program.md` (the agent's manual). Key decisions:
   budget-limited: the proxy will reject them unfairly. Default budget `TRAIN_MINUTES=90`;
   give a big bet a longer run with `--budget-min <N>`. No stop — runs forever.
 
-⚠️ **These objective + seed changes are NOT yet GPU-re-validated.** The self-test passes
-(objective ordering correct), but a real `--hf` iteration with the teacher-seed + across-
-levels scoring hasn't been run. **Re-validate before trusting scores** (see Next steps).
+✅ **GPU-re-validated** (found + fixed 2 bugs while doing it):
+- Teacher per-level curve is sane (L0: 61ms/absrel 0.0082 → L9: 179ms/0.0063).
+- **Seed reproduces the teacher exactly** (excess = -0.0000, speedup 1.00x, feat loss
+  literally 0) — "start at teacher" works.
+- **Bug: training a teacher-init model collapsed it** (absrel 0.007→0.70 in 9 steps).
+  Two causes, both fixed: (1) the depth distillation target was computed at the teacher's
+  default token count (3600) while the student trains at 1200 — an inconsistent objective;
+  now both are at FEATURE_TOKENS. (2) LR 2e-4 / WD 0.05 is too aggressive for a good init
+  (AdamW takes ~full-LR steps even at ~0 loss); now LR 5e-5 + 100-step warmup + WD 0.01.
+  After the fix, training PRESERVES the init (absrel 0.007→0.012, within band, δ1 0.998).
+- Loop runs end-to-end with across-levels scoring; results.csv logs `budget_min`.
+
+The methodology + harness are validated. Remaining work is research, not plumbing.
 
 ## Where we are
 

@@ -89,8 +89,13 @@ FEATURE_TOKENS = 1200      # token grid used during training (speed vs fidelity)
 BUDGET_MINUTES = None      # None -> prepare.TRAIN_MINUTES; else minutes for THIS experiment
 
 # --- optimisation ----------------------------------------------------------- #
-LR = 2e-4
-WEIGHT_DECAY = 0.05
+# The student is initialised FROM the teacher (or best student), i.e. near a good
+# optimum, so fine-tune GENTLY: AdamW takes ~full-LR steps even at near-zero loss, so a
+# high LR / high weight-decay walks a good init straight off its optimum (observed: a
+# teacher-perfect seed collapsed in ~9 steps at LR 2e-4). Low LR + warmup + low WD.
+LR = 5e-5                  # peak LR (fine-tuning, not from-scratch)
+WARMUP_STEPS = 100         # linear LR warmup from 0 -> LR (lets Adam's variance settle)
+WEIGHT_DECAY = 0.01        # low: high WD pulls inherited weights toward 0 (destructive)
 BATCH_SIZE = 2
 INHERIT_TEACHER = True     # copy ALL matching teacher weights (encoder + decoder). At the
                            # teacher-sized seed this inherits the FULL teacher; as you
@@ -159,7 +164,7 @@ def build_student() -> "tuple[torch.nn.Module, dict]":
             best_sd = torch.load(best, map_location="cpu", weights_only=False)["model"]
             n_best = _copy_matching(student, best_sd, prefixes=None)  # inherit ALL matching
             print(f"[train] warm-start parent: {best}")
-    print(f"[train] warm-start: {n_teacher} tensors from teacher decoder, "
+    print(f"[train] warm-start: {n_teacher} tensors from teacher (enc+dec), "
           f"{n_best} from best student ({WARM_START_FROM})")
     return student, cfg
 
@@ -306,6 +311,9 @@ def main(run_dir: Path, use_hf: bool = False,
         idx = rng.integers(0, n, size=BATCH_SIZE)
         samples = [train_set[int(i)] for i in idx]
         losses = distill_step(student, teacher, samples, dev, feat_proj=feat_proj)
+        lr_now = LR * min(1.0, (step + 1) / max(1, WARMUP_STEPS))   # linear warmup
+        for g in opt.param_groups:
+            g["lr"] = lr_now
         opt.zero_grad(set_to_none=True)
         losses["total"].backward()
         torch.nn.utils.clip_grad_norm_(params, 1.0)
