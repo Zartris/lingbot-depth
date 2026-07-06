@@ -55,8 +55,8 @@ STUDENT_BACKBONE = "dinov2_vits14"     # vits14 (fastest) | vitb14 | vitl14
 STUDENT_NUM_TOKENS_RANGE = [900, 2400]  # fewer tokens than teacher [1200,3600] -> faster
 
 # --- distillation recipe ---------------------------------------------------- #
-W_OUTPUT_DISTILL = 1.0     # match teacher refined depth (log space)
-W_FEATURE_DISTILL = 1.0    # match teacher encoder features (same dim -> no projector)
+W_OUTPUT_DISTILL = 1.0     # match teacher refined depth (linear-space L1)
+W_FEATURE_DISTILL = 1.0    # match teacher encoder features (via a learned 1x1 projector)
 W_GT = 0.5                 # supervise on real ground-truth depth where available
 FEATURE_TOKENS = 1200      # token grid used during training (speed vs fidelity)
 
@@ -156,13 +156,14 @@ def _copy_matching(dst: torch.nn.Module, src_state: Dict[str, torch.Tensor],
 #  Batch prep                                                                   #
 # --------------------------------------------------------------------------- #
 
-def _log_l1(pred, target, valid):
-    """L1 in log-depth space on valid pixels (scale-robust, matches remap_depth_out)."""
+def _depth_l1(pred, target, valid):
+    """Masked L1 in LINEAR (metric) depth space. The model's output remap is 'linear',
+    so the head can emit negative depth; a log-space loss would clamp those to a
+    constant and give ZERO gradient (the student then drifts to negative depth — this
+    actually happened). Linear L1 penalises negatives directly and pulls them back up."""
     if valid.sum() == 0:
         return pred.new_zeros(())
-    p = torch.log(pred.clamp_min(1e-3))
-    t = torch.log(target.clamp_min(1e-3))
-    return (F.l1_loss(p, t, reduction="none") * valid).sum() / valid.sum().clamp_min(1)
+    return (F.l1_loss(pred, target, reduction="none") * valid).sum() / valid.sum().clamp_min(1)
 
 
 def distill_step(student, teacher, samples, dev, feat_proj=None) -> Dict[str, torch.Tensor]:
@@ -199,7 +200,7 @@ def distill_step(student, teacher, samples, dev, feat_proj=None) -> Dict[str, to
     # Output distillation — match the teacher's refined depth.
     if W_OUTPUT_DISTILL > 0:
         valid = (t_depth > prepare.MIN_DEPTH) & (t_depth < prepare.MAX_DEPTH) & torch.isfinite(t_depth)
-        losses["out"] = W_OUTPUT_DISTILL * _log_l1(s_depth.float(), t_depth.float(), valid.float())
+        losses["out"] = W_OUTPUT_DISTILL * _depth_l1(s_depth.float(), t_depth.float(), valid.float())
 
     # Ground-truth supervision — only where real gt is present.
     if W_GT > 0:
@@ -217,7 +218,7 @@ def distill_step(student, teacher, samples, dev, feat_proj=None) -> Dict[str, to
             gt = torch.tensor(np.stack(g_stack), device=dev)
             mask = torch.tensor(np.stack(m_stack), device=dev)
             if mask.sum() > 0:
-                losses["gt"] = W_GT * _log_l1(s_depth.float(), gt, mask)
+                losses["gt"] = W_GT * _depth_l1(s_depth.float(), gt, mask)
 
     losses["total"] = sum(losses.values()) if losses else s_depth.new_zeros(())
     return losses

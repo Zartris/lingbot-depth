@@ -645,19 +645,41 @@ class Baseline:
     params: int
 
 
+DEGENERATE_PENALTY = 1000.0   # a student that doesn't produce usable depth must lose big
+
+
+def _wavg(real_v: float, sim_v: float) -> float:
+    """Weighted mean over whichever domains are FINITE (renormalised). Never nan-poisons
+    — a domain with no samples (metric = nan) is dropped, not folded in as 0*nan."""
+    parts = (([(ACC_WEIGHT_REAL, real_v)] if np.isfinite(real_v) else [])
+             + ([(ACC_WEIGHT_SIM, sim_v)] if np.isfinite(sim_v) else []))
+    wsum = sum(w for w, _ in parts)
+    return sum(w * v for w, v in parts) / wsum if wsum > 0 else float("nan")
+
+
 def objective(latency_ms: float, acc: Dict[str, float], base: Baseline) -> float:
     """Collapse (latency, accuracy) into ONE number. Lower is better.
 
-    score = latency_ms * (1 + PENALTY * <accuracy-tolerance violations>)
+    score = latency_ms * (1 + PENALTY * <accuracy-tolerance violations vs teacher>)
 
-    The student can only lower the score by getting faster while staying within the
-    accuracy band around the teacher. `acc` carries weighted absrel/delta1 over the
-    real+sim eval domains.
+    A DEGENERATE student — no usable depth (absrel/delta1 non-finite) or near-zero
+    delta1 — is hit with a huge fixed penalty so it can NEVER win by being fast. Without
+    this the search collapses onto fast-but-broken students (observed: a student emitting
+    negative depth scored ~= latency because nan baseline metrics zeroed the penalty).
     """
     absrel = acc["absrel_weighted"]
     delta1 = acc["delta1_weighted"]
-    base_absrel = ACC_WEIGHT_REAL * base.absrel_real + ACC_WEIGHT_SIM * base.absrel_sim
-    base_delta1 = ACC_WEIGHT_REAL * base.delta1_real + ACC_WEIGHT_SIM * base.delta1_sim
+
+    # Degeneracy guard: unusable output loses big, regardless of latency.
+    if (not np.isfinite(absrel)) or (not np.isfinite(delta1)) or (delta1 < 0.05):
+        return float(latency_ms * (1.0 + DEGENERATE_PENALTY))
+
+    base_absrel = _wavg(base.absrel_real, base.absrel_sim)
+    base_delta1 = _wavg(base.delta1_real, base.delta1_sim)
+    if not np.isfinite(base_absrel):
+        base_absrel = absrel   # baseline unusable -> no absrel constraint
+    if not np.isfinite(base_delta1):
+        base_delta1 = delta1
 
     absrel_violation = max(0.0, absrel / max(base_absrel, 1e-6) - (1.0 + ACC_TOLERANCE))
     delta1_violation = max(0.0, base_delta1 * (1.0 - DELTA_TOLERANCE) - delta1)
@@ -674,7 +696,11 @@ def objective(latency_ms: float, acc: Dict[str, float], base: Baseline) -> float
 def _predict(model: "torch.nn.Module", s: Sample,
              resolution_level: int = BENCH_RESOLUTION_LEVEL) -> np.ndarray:
     """Run a model's infer() on one Sample at `resolution_level`; return refined depth
-    as (H, W) float32. The accuracy path uses the SAME level the latency is timed at."""
+    as (H, W) float32. The accuracy path uses the SAME level the latency is timed at.
+
+    apply_mask=False on purpose: we measure DEPTH quality on every pixel where GT is
+    valid, independent of the student's confidence mask — otherwise a student could
+    inflate its score by masking out the pixels it gets wrong."""
     dev = device()
     H, W = s.rgb.shape[:2]
     img = torch.tensor(s.rgb / 255.0, dtype=torch.float32, device=dev).permute(2, 0, 1)[None]
@@ -683,7 +709,8 @@ def _predict(model: "torch.nn.Module", s: Sample,
     K[0] /= W
     K[1] /= H
     K = torch.tensor(K, device=dev)[None]
-    out = model.infer(img, depth_in=depth, intrinsics=K, resolution_level=resolution_level)
+    out = model.infer(img, depth_in=depth, intrinsics=K, apply_mask=False,
+                      resolution_level=resolution_level)
     return out["depth"].squeeze().float().cpu().numpy()
 
 

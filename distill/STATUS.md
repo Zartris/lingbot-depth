@@ -78,17 +78,38 @@ be streamed per camera before the first triplet completes.
 5. Hand to auto-research: the agent edits `train.py` / `student_model/`, loop with
    `--hf --accept`.
 
-## Ready for auto-research? Almost — two things unproven
+## Ready for auto-research? YES — validated end-to-end, two real bugs found & fixed
 
-The plumbing is fully validated end-to-end on real streamed data, so the loop can run.
-Two substantive unknowns remain (best closed with ONE real `--hf` iteration, ~20 min):
+Ran real `--hf` iterations. Everything now works AND two critical bugs were caught and
+fixed (this is exactly what the validation was for):
 
-1. **Does distillation actually converge?** We've only run 6-step plumbing; that the
-   student's score *improves* with a real budget is unproven (it's what the research
-   loop explores, but confirm the machinery produces a real gain first).
-2. **The `--accept` → `promote_best` → committed-champion path** has only been dry-run
-   tested, and the warm-start cascade's best-inheritance hasn't run across 2 real
-   iterations (run 1 had "0 from best" — no champion yet).
+- ✅ **Convergence**: with the fixed loss, the student converges to valid positive depth
+  (range 1.15–2.31 m, 100% valid; was −268 m garbage before) and losses drop cleanly
+  (out 6.7→0.2, gt 3.3→0.1) in ~6 min.
+- ✅ **Warm-start cascade** proven: iter 2 inherited 305 tensors from the champion
+  (vs iter 1's "0 from best").
+- ✅ **`--accept` → promote → committed champion** and keep-or-revert work.
+- ✅ **`--compare`** across resolution levels works.
+
+**Bug 1 (objective, CRITICAL — fixed).** A degenerate student (negative depth →
+absrel=inf, delta1=0) scored ≈ latency with ZERO penalty and got promoted as champion.
+Cause: baseline real-domain metrics are `nan` (real off by default) → nan-poisoned the
+penalty to 0. Fix: `_wavg` renormalises the baseline over finite domains, plus a hard
+degeneracy guard (non-finite absrel/delta1 or delta1<0.05 → ×1000 penalty). Now garbage
+scores ~1000× worse; verified.
+
+**Bug 2 (recipe, fixed).** The model's output remap is `linear` (head emits metric depth
+directly, can be negative), but the loss was log-space — `log(clamp(neg,1e-3))` gives
+ZERO gradient, so the student drifted to negative depth. Fix: `_depth_l1` is now linear
+L1, which penalises negatives directly. Also eval now uses `apply_mask=False` so a
+student can't inflate its score by masking the pixels it gets wrong.
+
+**Tuning note (not a blocker):** the sim teacher is near-perfect (absrel 0.0063), so the
+accuracy tolerance is essentially unreachable and the objective is accuracy-dominated
+(scores are large, ~1e5). Ordering is correct (better student → lower score), so the
+research signal is valid; may want to loosen `ACC_TOLERANCE` / cap the absrel violation
+later. Also the mask head is NOT distilled (no mask loss) — fine for scoring
+(apply_mask=False), but add a mask loss if deployment needs the confidence mask.
 
 ## Known gaps / watch-list
 
