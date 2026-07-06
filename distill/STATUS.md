@@ -3,6 +3,30 @@
 Working notes for continuing the LingBot-Depth distillation auto-research harness.
 Branch: `worktree-distill-scaffold` → PR #1 on `Zartris/lingbot-depth`.
 
+## METHODOLOGY (current — supersedes earlier "ViT-S student" framing)
+
+The approach is **incremental compression from the teacher**, not a from-scratch small
+student. Full detail is in `program.md` (the agent's manual). Key decisions:
+
+- **Seed = the teacher** (`STUDENT_BACKBONE="dinov2_vitl14"`, `build_student` inherits ALL
+  matching teacher weights). Shrink one small, weight-inheriting step at a time.
+- **Warm-start from the best student** each iteration (cascade fresh<teacher<best); the
+  teacher is the fallback, not a per-iteration reseed.
+- **Objective** (rewritten): scored ACROSS resolution levels [0,3,6,9]. Accuracy measured
+  vs the **TEACHER (fixed anchor)**, never best-student (no ratcheting). `AbsRel` may
+  exceed the teacher by ≤ `ACCURACY_BAND_ABSREL=0.01` (else rejected); within band,
+  `score = W_SPEED·mean_latency + W_ACC·mean(AbsRel excess)` with `W_ACC≫W_SPEED`
+  (accuracy valued higher than speed). Degenerate output → worst score.
+- **Token dial (resolution_level 0-9) is a preserved USER FEATURE, not a search knob** —
+  `num_tokens_range` fixed to the teacher's; you can't "win" by using fewer tokens.
+- **Search space is OPEN** (smaller backbones allowed) but big low-transfer moves are
+  budget-limited: the proxy will reject them unfairly. Default budget `TRAIN_MINUTES=90`;
+  give a big bet a longer run with `--budget-min <N>`. No stop — runs forever.
+
+⚠️ **These objective + seed changes are NOT yet GPU-re-validated.** The self-test passes
+(objective ordering correct), but a real `--hf` iteration with the teacher-seed + across-
+levels scoring hasn't been run. **Re-validate before trusting scores** (see Next steps).
+
 ## Where we are
 
 The harness is built and **verified end-to-end on the GPU** (`--test-run` passed on an

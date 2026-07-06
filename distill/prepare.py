@@ -61,12 +61,21 @@ DATASET_ID = "robbyant/mdm_depth"
 ACC_WEIGHT_REAL = 0.7
 ACC_WEIGHT_SIM = 0.3
 
-# Accuracy tolerance band vs. the teacher, evaluated against ground-truth depth.
-# The student is allowed to be this much worse than the teacher before it gets
-# penalised. Tighten these to demand more accuracy, loosen to buy more speed.
-ACC_TOLERANCE = 0.05          # 5% — absrel may rise by up to 5% relative to teacher
-DELTA_TOLERANCE = 0.01        # delta1 may drop by up to 1 abs point vs teacher
-PENALTY = 50.0                # multiplier on tolerance violations (in ms-equivalent)
+# ---- Objective: accuracy anchored to the TEACHER, valued higher than speed --------
+# We start from the teacher and shrink; a shrink is acceptable only if it stays close
+# to the TEACHER's accuracy (a FIXED anchor — never the best student, or the bar would
+# ratchet down and students would drift worse and worse). Accuracy and latency are both
+# scored ACROSS the resolution_level range (SCORE_LEVELS), because that 0-9 dial is a
+# preserved user feature, not something the search may "win" by lowering.
+ACCURACY_BAND_ABSREL = 0.01   # a student may exceed the teacher's AbsRel by at most this
+                              #   (at ANY scored level) — beyond it, the student is rejected.
+W_ACC = 100_000.0             # score weight on AbsRel-error-vs-teacher, in ms per unit AbsRel.
+W_SPEED = 1.0                 # score weight on latency (ms). W_ACC >> W_SPEED => accuracy is
+                              #   valued higher: a more-accurate-but-slightly-slower student
+                              #   is preferred over a faster, less-accurate one. Raise W_ACC
+                              #   to prioritise accuracy even more; lower it to buy more speed.
+REJECT_SCORE = 1e9            # over the accuracy band -> ranked here (still ordered by excess)
+DEGENERATE_SCORE = 1e12       # no usable depth at all -> ranked worst
 
 # Depth eval range (metres). Pixels outside are ignored in the metrics.
 MIN_DEPTH = 0.1
@@ -100,8 +109,11 @@ N_EVAL_REAL = 0
 # ---- Compute budget per experiment (FROZEN) ----------------------------------
 # Equal compute per run => comparable scores (autoresearch's fixed-budget premise).
 # The agent optimises what to do WITHIN this budget, not the budget itself.
-TRAIN_MINUTES = 20.0          # proxy-run wall-clock; humans promote winners to longer runs
-MAX_STEPS = 100_000           # hard cap
+TRAIN_MINUTES = 90.0          # default per-iteration budget. High-transfer (incremental)
+                              # changes are judged fairly at this budget; big low-transfer
+                              # jumps (e.g. a fresh small backbone) still won't be — give
+                              # those a longer run with `--budget-min` (see program.md).
+MAX_STEPS = 1_000_000         # step cap (time is the real limit)
 
 # ---- Teacher-target cache ----------------------------------------------------
 # The ViT-L teacher is expensive; caching its per-sample outputs turns the inner loop
@@ -636,56 +648,49 @@ def benchmark_latency(model: "torch.nn.Module", hw: Tuple[int, int] = BENCH_INPU
 
 @dataclass
 class Baseline:
-    """Teacher reference numbers, measured once, that define the tolerance band."""
+    """Teacher reference numbers, measured once. `curve` is the teacher's per-level
+    accuracy+latency (the fixed accuracy ANCHOR the student is scored against)."""
     latency_ms: float
     absrel_real: float
     absrel_sim: float
     delta1_real: float
     delta1_sim: float
     params: int
+    curve: Optional[Dict[str, Dict[str, float]]] = None   # str(level) -> {absrel_weighted, latency_ms, ...}
 
 
-DEGENERATE_PENALTY = 1000.0   # a student that doesn't produce usable depth must lose big
+def objective(per_level: Dict[int, Dict[str, float]], base: Baseline) -> float:
+    """The single scalar the agent minimises (lower is better), scored ACROSS the
+    resolution levels (per_level: level -> {absrel_weighted, delta1_weighted, latency_ms}).
 
-
-def _wavg(real_v: float, sim_v: float) -> float:
-    """Weighted mean over whichever domains are FINITE (renormalised). Never nan-poisons
-    — a domain with no samples (metric = nan) is dropped, not folded in as 0*nan."""
-    parts = (([(ACC_WEIGHT_REAL, real_v)] if np.isfinite(real_v) else [])
-             + ([(ACC_WEIGHT_SIM, sim_v)] if np.isfinite(sim_v) else []))
-    wsum = sum(w for w, _ in parts)
-    return sum(w * v for w, v in parts) / wsum if wsum > 0 else float("nan")
-
-
-def objective(latency_ms: float, acc: Dict[str, float], base: Baseline) -> float:
-    """Collapse (latency, accuracy) into ONE number. Lower is better.
-
-    score = latency_ms * (1 + PENALTY * <accuracy-tolerance violations vs teacher>)
-
-    A DEGENERATE student — no usable depth (absrel/delta1 non-finite) or near-zero
-    delta1 — is hit with a huge fixed penalty so it can NEVER win by being fast. Without
-    this the search collapses onto fast-but-broken students (observed: a student emitting
-    negative depth scored ~= latency because nan baseline metrics zeroed the penalty).
+    Rules (see program.md):
+      * Accuracy is measured vs the TEACHER at the SAME level (base.curve), a fixed
+        anchor — never the best student (which would let the bar ratchet down).
+      * Degenerate output (no usable depth) -> DEGENERATE_SCORE (worst).
+      * Exceeding the teacher's AbsRel by more than ACCURACY_BAND_ABSREL at any level
+        -> REJECT_SCORE band (still ordered by how far over, so the search can climb back).
+      * Otherwise  score = W_SPEED * mean_latency + W_ACC * mean(AbsRel excess vs teacher).
+        W_ACC >> W_SPEED, so accuracy is valued higher than speed: the search takes
+        accuracy-preserving speedups and refuses to trade accuracy cheaply. Because the
+        student starts AT the teacher and shrinks, this descends: faster at ~teacher
+        accuracy wins; anything that degrades accuracy beyond the band is rejected.
     """
-    absrel = acc["absrel_weighted"]
-    delta1 = acc["delta1_weighted"]
-
-    # Degeneracy guard: unusable output loses big, regardless of latency.
-    if (not np.isfinite(absrel)) or (not np.isfinite(delta1)) or (delta1 < 0.05):
-        return float(latency_ms * (1.0 + DEGENERATE_PENALTY))
-
-    base_absrel = _wavg(base.absrel_real, base.absrel_sim)
-    base_delta1 = _wavg(base.delta1_real, base.delta1_sim)
-    if not np.isfinite(base_absrel):
-        base_absrel = absrel   # baseline unusable -> no absrel constraint
-    if not np.isfinite(base_delta1):
-        base_delta1 = delta1
-
-    absrel_violation = max(0.0, absrel / max(base_absrel, 1e-6) - (1.0 + ACC_TOLERANCE))
-    delta1_violation = max(0.0, base_delta1 * (1.0 - DELTA_TOLERANCE) - delta1)
-
-    penalty = PENALTY * (absrel_violation + delta1_violation)
-    return float(latency_ms * (1.0 + penalty))
+    excesses, lats, worst_excess = [], [], 0.0
+    for lvl, s in per_level.items():
+        absrel, delta1 = s["absrel_weighted"], s["delta1_weighted"]
+        if (not np.isfinite(absrel)) or (not np.isfinite(delta1)) or (delta1 < 0.05):
+            return float(DEGENERATE_SCORE)
+        t = (base.curve or {}).get(str(lvl), {})
+        t_absrel = t.get("absrel_weighted", float("nan"))
+        excess = absrel - t_absrel if np.isfinite(t_absrel) else 0.0  # worse-than-teacher AbsRel
+        worst_excess = max(worst_excess, excess)
+        excesses.append(max(0.0, excess))
+        lats.append(s["latency_ms"])
+    if worst_excess > ACCURACY_BAND_ABSREL:                     # beyond allowed deviation
+        return float(REJECT_SCORE * (1.0 + worst_excess))
+    mean_excess = sum(excesses) / len(excesses)
+    mean_lat = sum(lats) / len(lats)
+    return float(W_SPEED * mean_lat + W_ACC * mean_excess)
 
 
 # ----------------------------------------------------------------------------- #
@@ -766,21 +771,55 @@ def evaluate(model: "torch.nn.Module", eval_set, base: Optional[Baseline] = None
         "delta1_sim": sim.get("delta1", float("nan")),
         "hole_absrel_real": real.get("hole_absrel", float("nan")),
     }
-    if base is not None:
-        result["score"] = objective(latency, result, base)
-        result["speedup_vs_teacher"] = base.latency_ms / latency if latency > 0 else 0.0
-    return result
+    return result   # per-level metrics only; scoring is done by score_student()
+
+
+def score_student(model: "torch.nn.Module", eval_set, base: Baseline,
+                  teacher: Optional["torch.nn.Module"] = None) -> Dict[str, float]:
+    """Evaluate a student ACROSS the resolution levels and compute the objective. Returns
+    a flat dict for the results log (score + summary), and writes the per-level detail to
+    runs/last_score_levels.json. This is what run.one_iteration uses to rank a student."""
+    teacher = teacher or load_teacher()
+    per_level: Dict[int, Dict[str, float]] = {}
+    for lvl in RESOLUTION_SWEEP:
+        r = evaluate(model, eval_set, base=None, teacher=teacher, resolution_level=lvl)
+        per_level[lvl] = {"absrel_weighted": r["absrel_weighted"],
+                          "delta1_weighted": r["delta1_weighted"],
+                          "latency_ms": r["latency_ms"]}
+    score = objective(per_level, base)
+
+    lats = [v["latency_ms"] for v in per_level.values()]
+    absrels = [v["absrel_weighted"] for v in per_level.values()]
+    delta1s = [v["delta1_weighted"] for v in per_level.values()]
+    t_lats = [(base.curve or {}).get(str(l), {}).get("latency_ms", float("nan")) for l in RESOLUTION_SWEEP]
+    t_mean = float(np.nanmean(t_lats)) if base.curve else float("nan")
+    s_mean = float(np.mean(lats))
+    (RUNS_DIR / "last_score_levels.json").write_text(
+        json.dumps({str(k): v for k, v in per_level.items()}, indent=2))
+    return {
+        "score": score,
+        "params": count_params(model),
+        "mean_latency_ms": s_mean,
+        "mean_absrel": float(np.nanmean(absrels)),
+        "min_delta1": float(np.nanmin(delta1s)) if delta1s else float("nan"),
+        "speedup_vs_teacher": (t_mean / s_mean) if (np.isfinite(t_mean) and s_mean > 0) else float("nan"),
+    }
 
 
 def measure_teacher_baseline(eval_set, teacher: Optional["torch.nn.Module"] = None) -> Baseline:
-    """Measure the teacher's own accuracy + latency to anchor the tolerance band."""
+    """Measure the teacher's accuracy + latency, INCLUDING its per-level curve — the fixed
+    accuracy anchor the student is scored against (see objective)."""
     teacher = teacher or load_teacher()
     res = evaluate(teacher, eval_set, base=None, teacher=teacher)
+    rows = teacher_resolution_report(eval_set, teacher=teacher, levels=RESOLUTION_SWEEP)
+    curve = {str(r["resolution_level"]): {"absrel_weighted": r["absrel_weighted"],
+                                          "delta1_weighted": r["delta1_weighted"],
+                                          "latency_ms": r["latency_ms"]} for r in rows}
     base = Baseline(
         latency_ms=res["latency_ms"],
         absrel_real=res["absrel_real"], absrel_sim=res["absrel_sim"],
         delta1_real=res["delta1_real"], delta1_sim=res["delta1_sim"],
-        params=int(res["params"]),
+        params=int(res["params"]), curve=curve,
     )
     (RUNS_DIR / "teacher_baseline.json").write_text(json.dumps(asdict(base), indent=2))
     return base
@@ -908,16 +947,31 @@ def _selftest() -> None:
               % (bb, cfg["encoder"]["dim_out"], cfg["neck"]["dim_in"][0],
                  cfg["encoder"]["intermediate_layers"]))
 
-    print("[selftest] objective monotonic in latency & penalises accuracy loss ...")
-    base = Baseline(latency_ms=100.0, absrel_real=0.05, absrel_sim=0.04,
-                    delta1_real=0.97, delta1_sim=0.98, params=300_000_000)
-    good = {"absrel_weighted": 0.047, "delta1_weighted": 0.972}
-    bad = {"absrel_weighted": 0.20, "delta1_weighted": 0.80}
-    assert objective(40, good, base) < objective(80, good, base)          # faster is better
-    assert objective(40, bad, base) > objective(40, good, base)           # accuracy loss hurts
-    assert objective(40, good, base) < base.latency_ms                    # a real speedup wins
-    print("           score(fast,ok)=%.1f  score(fast,bad)=%.1f"
-          % (objective(40, good, base), objective(40, bad, base)))
+    print("[selftest] objective: accuracy vs teacher (fixed), band, accuracy>speed ...")
+    # teacher curve: near-perfect, faster at lower levels
+    curve = {"0": {"absrel_weighted": 0.010, "delta1_weighted": 0.99, "latency_ms": 120.0},
+             "3": {"absrel_weighted": 0.008, "delta1_weighted": 0.99, "latency_ms": 170.0},
+             "6": {"absrel_weighted": 0.007, "delta1_weighted": 0.99, "latency_ms": 250.0},
+             "9": {"absrel_weighted": 0.006, "delta1_weighted": 1.00, "latency_ms": 350.0}}
+    base = Baseline(latency_ms=350.0, absrel_real=float("nan"), absrel_sim=0.006,
+                    delta1_real=float("nan"), delta1_sim=1.0, params=321_000_000, curve=curve)
+
+    def lv(dabsrel, lat, delta1=0.98):   # student per-level, dabsrel = excess over teacher
+        return {l: {"absrel_weighted": curve[str(l)]["absrel_weighted"] + dabsrel,
+                    "delta1_weighted": delta1, "latency_ms": lat} for l in RESOLUTION_SWEEP}
+
+    within_fast = objective(lv(0.002, 100.0), base)   # tiny accuracy cost, big speed
+    within_slow = objective(lv(0.002, 200.0), base)   # same accuracy, slower
+    more_acc    = objective(lv(0.0005, 210.0), base)  # better accuracy, a bit slower
+    over_band   = objective(lv(0.05, 100.0), base)    # accuracy blown past the 0.01 band
+    degenerate  = objective({l: {"absrel_weighted": float("inf"), "delta1_weighted": 0.0,
+                                 "latency_ms": 30.0} for l in RESOLUTION_SWEEP}, base)
+    assert within_fast < within_slow                              # at iso-accuracy, faster wins
+    assert more_acc < within_slow                                 # accuracy valued higher than speed
+    assert over_band > within_slow and over_band >= REJECT_SCORE  # beyond band -> rejected
+    assert degenerate >= DEGENERATE_SCORE and degenerate > over_band   # garbage -> worst
+    print("           within(fast)=%.1f within(slow)=%.1f more_acc=%.1f | over_band=%.0f degenerate=%.0f"
+          % (within_fast, within_slow, more_acc, over_band, degenerate))
     print("[selftest] OK")
 
 

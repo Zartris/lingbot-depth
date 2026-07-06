@@ -14,8 +14,9 @@ only way the score can improve is a genuinely better student.
 Usage:
   python -m distill.run --smoke             # logic self-test (no GPU, no downloads)
   python -m distill.run --test-run          # tiny end-to-end pipeline check on GPU
-  python -m distill.run --setup-baseline   # measure the teacher once (do this first)
+  python -m distill.run --setup-baseline   # measure the teacher + per-level curve (once)
   python -m distill.run                     # one train+eval iteration, log the score
+  python -m distill.run --budget-min 300    # give THIS run a longer budget (big bets)
   python -m distill.run --accept            # ... and git-commit train.py if it improved
   python -m distill.run --smoke             # tiny local (no-download) plumbing check
   python -m distill.run --eval-only PATH    # score an existing student.pt
@@ -166,16 +167,16 @@ def one_iteration(accept: bool, use_hf: bool, minutes: float = None,
     ckpt = train.main(run_dir, use_hf=use_hf, minutes=minutes, max_steps=max_steps)
     student = _load_student(ckpt)
 
-    print("[run] evaluating ...")
-    res = prepare.evaluate(student, _eval_set(use_hf), base=base, teacher=prepare.load_teacher())
+    print("[run] evaluating across resolution levels ...")
+    res = prepare.score_student(student, _eval_set(use_hf), base, teacher=prepare.load_teacher())
 
     row = {"run_id": run_id, "backbone": train.STUDENT_BACKBONE,
-           "tokens": str(train.STUDENT_NUM_TOKENS_RANGE), **{k: round(v, 5) for k, v in res.items()}}
+           **{k: round(v, 5) for k, v in res.items()}}
     _append_result(row)
 
-    print(f"[run] score={res['score']:.2f}  latency={res['latency_ms']:.1f}ms  "
-          f"speedup={res.get('speedup_vs_teacher', 0):.2f}x  "
-          f"absrel_w={res['absrel_weighted']:.4f}  delta1_w={res['delta1_weighted']:.3f}  "
+    print(f"[run] score={res['score']:.2f}  mean_latency={res['mean_latency_ms']:.1f}ms  "
+          f"speedup={res.get('speedup_vs_teacher', float('nan')):.2f}x  "
+          f"mean_absrel={res['mean_absrel']:.4f}  min_delta1={res['min_delta1']:.3f}  "
           f"params={res['params']/1e6:.1f}M")
 
     prev_best = _best_score_excluding(run_id)
@@ -257,8 +258,8 @@ def _best_score_excluding(run_id: str) -> float:
 
 def _git_commit(run_id: str, res: dict) -> None:
     msg = (f"distill: accept {run_id} "
-           f"(score={res['score']:.1f}, {res.get('speedup_vs_teacher',0):.2f}x, "
-           f"absrel_w={res['absrel_weighted']:.4f})")
+           f"(score={res['score']:.1f}, {res.get('speedup_vs_teacher', float('nan')):.2f}x, "
+           f"mean_absrel={res['mean_absrel']:.4f})")
     subprocess.run(["git", "add", "distill/train.py", "distill/student_model",
                     "distill/runs/results.csv"], cwd=prepare.REPO_ROOT)
     subprocess.run(["git", "commit", "-m", msg], cwd=prepare.REPO_ROOT)
@@ -280,6 +281,11 @@ def main() -> None:
                     help="tiny end-to-end pipeline check on GPU (a few steps, local examples), "
                          "no commit — run this before the first real iteration")
     ap.add_argument("--hf", action="store_true", help="use the streamed HF dataset (default: local)")
+    ap.add_argument("--budget-min", type=float, default=None,
+                    help="override the frozen per-iteration training budget (minutes) for THIS "
+                         "run — give a big low-transfer bet a longer, fair run. Default: prepare.TRAIN_MINUTES")
+    ap.add_argument("--budget-steps", type=int, default=None,
+                    help="override the step cap for this run (default: prepare.MAX_STEPS)")
     args = ap.parse_args()
 
     use_hf = args.hf and not args.smoke
@@ -312,7 +318,7 @@ def main() -> None:
     if args.eval_only:
         base = prepare.load_baseline()
         student = _load_student(Path(args.eval_only))
-        res = prepare.evaluate(student, _eval_set(use_hf), base=base, teacher=prepare.load_teacher())
+        res = prepare.score_student(student, _eval_set(use_hf), base, teacher=prepare.load_teacher())
         print(res)
         return
 
@@ -328,7 +334,8 @@ def main() -> None:
               "`python -m distill.run --setup-baseline` then `python -m distill.run`.")
         return
 
-    one_iteration(accept=args.accept, use_hf=use_hf)
+    one_iteration(accept=args.accept, use_hf=use_hf,
+                  minutes=args.budget_min, max_steps=args.budget_steps)
 
 
 if __name__ == "__main__":

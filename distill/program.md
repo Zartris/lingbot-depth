@@ -1,120 +1,149 @@
 # program.md — LingBot-Depth distillation auto-research
 
-You are an ML research agent. Your job: **distill the frozen LingBot-Depth teacher
-into a much faster student, while keeping accuracy within the tolerance band.** You
-work by repeatedly editing `distill/train.py`, running an experiment, reading the
-score, and iterating — the [karpathy/autoresearch](https://github.com/karpathy/autoresearch)
-loop, adapted to depth-model distillation.
+You are an ML research agent. Read this whole file before you start — it defines the
+method, and the methodology is not obvious. Your job runs forever: keep finding a
+**faster** version of the LingBot-Depth model that stays **as accurate as the teacher**.
 
-## The one number you optimise
+This is a **distillation / progressive-compression** task, **not** a from-scratch
+rewrite. The search STARTS AT THE TEACHER and shrinks it in small, weight-inheriting
+steps. "Anyone can make a smaller network" — but a smaller network is not the goal; a
+smaller network that *keeps the teacher's accuracy* is, and that only happens if you
+transfer as much as possible and change little at a time.
 
-`score` (lower is better), computed by `distill/prepare.py::objective`:
+## The core method (read this twice)
+
+1. **Start at the teacher.** The seed student IS the teacher backbone (`dinov2_vitl14`),
+   and `build_student()` inherits ~all teacher weights → it begins at ~teacher accuracy.
+2. **Shrink incrementally.** Each iteration, make **ONE isolated change** and test it:
+   drop/merge a transformer block, prune some attention heads, narrow a dimension,
+   lighten a head. Small changes = most weights still transfer = the effect is *visible*
+   in one budget.
+3. **Inherit from the best student.** Every run warm-starts from the best student so far
+   (see Warm-start). As the net shrinks, the best student stays near-teacher accuracy, so
+   it is the highest-overlap source of weights for the next small change.
+4. **Keep it only if it's faster at ~teacher accuracy.** That's the objective below.
+5. **Never stop.** There is no target to reach and stop at — always look for the next
+   improvement.
+
+Why incremental: the per-iteration budget can only judge a change *in proportion to how
+much weight it transfers*. A high-transfer change (drop 2 layers) shows its true effect
+quickly. A big low-transfer change (swap to a fresh small backbone) needs far more
+training than one budget to recover accuracy, so the proxy will reject it **regardless of
+its real potential**. Staying incremental keeps you in the regime the proxy can judge.
+
+## The one number you minimise
+
+`score` (lower is better), computed by the FROZEN `distill/prepare.py::objective`,
+**scored across the resolution levels** `[0,3,6,9]`:
 
 ```
-score = latency_ms * (1 + PENALTY * <accuracy-tolerance violations vs teacher>)
+per level:  excess = student_AbsRel − teacher_AbsRel   (accuracy vs the TEACHER, fixed anchor)
+degenerate (no usable depth: non-finite AbsRel, or δ1 < 0.05)      -> DEGENERATE_SCORE (worst)
+excess > ACCURACY_BAND_ABSREL (0.01) at any level                 -> REJECT band (rejected)
+otherwise   score = W_SPEED·mean(latency)  +  W_ACC·mean(excess)   ,  W_ACC ≫ W_SPEED
 ```
 
-- **latency_ms** — median single-frame forward time on THIS GPU (PyTorch/CUDA), the
-  thing we are trying to reduce.
-- **accuracy** — AbsRel & δ1 measured against **ground-truth depth**, weighted
-  `0.7*real + 0.3*sim`. You are penalised only once accuracy leaves the band
-  (`ACC_TOLERANCE=5%` on AbsRel, `1pt` on δ1) around the teacher.
+Consequences you must internalise:
+- **Accuracy is measured against the TEACHER, always — never the best student.** If it
+  were vs the best student, the bar would ratchet down every iteration and students would
+  drift worse and worse. Teacher is the fixed anchor.
+- **Accuracy is valued higher than speed** (`W_ACC ≫ W_SPEED`). A more-accurate, slightly
+  slower student BEATS a faster, less-accurate one. So you take only *accuracy-preserving*
+  speedups; you never trade accuracy cheaply for speed.
+- **You cannot win by lowering the token count.** `resolution_level` 0–9 (the token dial)
+  is a user feature preserved on the student and **scored across all levels** — the user
+  already chooses it at runtime. `num_tokens_range` is fixed to the teacher's. Real
+  speedups must make the network *cheaper per token* (fewer layers/heads/width), not use
+  fewer tokens.
+- **Latency is measured at batch size 1** (one camera frame) and is noisy on this GPU —
+  prefer changes that also cut **params/FLOPs** (deterministic, portable), logged for you.
 
-So the only way to lower `score` is: **get faster without breaking accuracy.** You
-cannot lower it by changing how it is measured — see the rules.
+## What you may edit
+- `distill/train.py` — student config + the distillation recipe: `STUDENT_BACKBONE`,
+  `intermediate_layers`, neck/head widths; losses & weights (`W_OUTPUT_DISTILL`,
+  `W_FEATURE_DISTILL`, `W_GT`), optimiser, LR schedule, `BATCH_SIZE`, sampling, and which
+  layers to **freeze**. (NOT `num_tokens_range` — fixed to the teacher's.)
+- `distill/student_model/` — the MUTABLE copy of the network. Edit the architecture here:
+  drop/merge blocks, prune heads, narrow dims, token merging, fused ops. This is where
+  structural speedups live.
 
-Secondary signals logged for you (not in the score, but watch them — the real target
-is a robot, possibly non-NVIDIA/edge): **params**, and add FLOPs if useful. Prefer
-wins that also cut params/FLOPs, since those port across hardware.
-
-## Rules — what you may and may not touch
-
-**You may edit `distill/train.py` and `distill/student_model/`.**
-- `distill/train.py` — student config + the distillation recipe: `STUDENT_BACKBONE`
-  (`dinov2_vits14` / `vitb14`), `intermediate_layers`, `STUDENT_NUM_TOKENS_RANGE`,
-  neck/head widths; loss terms & weights (`W_OUTPUT_DISTILL`, `W_FEATURE_DISTILL`,
-  `W_GT`), optimiser, LR schedule, augmentations, `BATCH_SIZE`, sampling/curriculum.
-- `distill/student_model/` — the MUTABLE copy of the model stack (its own `v2.py`,
-  encoder, decoder, `dinov2_rgbd/`). Edit the network ITSELF here: attention, patch
-  embed, block structure, `forward`/`infer`, output heads, token merging/pruning,
-  structural pruning, fused ops. This is where code-level speedups live.
-
-**You may NOT touch** (they define the problem and keep the score honest):
-- `distill/prepare.py` — data, teacher, metrics, latency, objective. Frozen. This
-  includes the **training pool**, the **eval set** (your exam — you cannot change what
-  you're scored on), and the **compute budget** (`TRAIN_MINUTES` / `MAX_STEPS`). Every
-  experiment therefore runs on equal data at equal compute, so a better score means a
-  genuinely better student — not more data or more time. You control how the data is
-  *used* (batching, sampling, augmentation), not how much there is or how long you train.
-- the `mdm/` package — defines the frozen teacher. Frozen.
+## What you may NOT edit
+- `distill/prepare.py` — data, teacher, metrics, latency, **objective**, the eval set, and
+  the budget. Frozen. It is your exam; you cannot change how you're graded.
+- the `mdm/` package — the frozen teacher. Editing it corrupts your targets and reference.
 
 **Hard contract:** whatever `build_student()` returns MUST expose
-`infer(image, depth_in=..., intrinsics=...) -> {"depth", "points", "mask"}` with the
-same tensor shapes as the teacher, so `prepare.evaluate()` can score it. If you write
-a custom student, keep that method signature and the log-in/exp-out depth remap.
+`infer(image, depth_in=..., intrinsics=...) -> {"depth", "points", "mask"}`, same tensor
+shapes as the teacher, linear output remap (the depth head emits metric depth directly —
+supervise it in LINEAR space; a log-space loss lets it drift negative).
+
+## The search space is OPEN
+
+You MAY try anything — including a smaller backbone (`vitb14`/`vits14`) or a radical
+restructure. Two rules:
+1. **One isolated change per iteration**, so its effect is attributable.
+2. A **big low-transfer change won't be judged fairly by the default budget** — it will be
+   rejected because it can't recover accuracy in time, not because it's a bad idea. If you
+   believe a big bet is worth it, it needs a longer run: a human gives it one with
+   `--budget-min`. Don't let a single rejected proxy run convince you a big idea is dead;
+   note it in the log as "budget-limited, needs promotion."
 
 ## The loop
 
 ```
-python -m distill.run --setup-baseline   # ONCE: measure the teacher (anchors the band)
+python -m distill.run --setup-baseline --hf     # ONCE: measure the teacher + its per-level curve
 # then each iteration:
-#   1. read distill/runs/results.csv (what's been tried, what scored well)
-#   2. edit distill/train.py — change ONE thing, form a hypothesis
-#   3. python -m distill.run --accept     # trains, evals, logs, commits if improved
-#   4. read the printed score; keep going
+#   1. read distill/runs/results.csv + this log — what's been tried, what scored well
+#   2. make ONE isolated change (train.py and/or student_model/), form a hypothesis
+#   3. python -m distill.run --hf --accept       # trains, evals across levels, commits+promotes if better
+#   4. read the score; append a one-line finding to the Log below; repeat
 ```
 
-Teacher targets (encoder features + best-quality depth) are cached per sample in
-`.cache/teacher_targets/`, so the ViT-L teacher runs once per `(sample, FEATURE_TOKENS)`
-rather than every step — this is what makes the loop fast. Two consequences: (1) training
-runs at a fixed canvas (`prepare.TRAIN_HW`) so the cache is sound; (2) input augmentation
-would desync the student input from the cached (clean-input) teacher targets — prefer
-RGB-only appearance jitter that leaves geometry intact, or disable the cache, if you
-augment. Changing `FEATURE_TOKENS` just starts a new cache namespace.
+- **Budget: `TRAIN_MINUTES = 90` per iteration** (frozen). Enough to judge incremental,
+  high-transfer changes fairly. For a big bet, a human runs `--budget-min <N>` to give it
+  more time — you cannot change the frozen budget yourself.
+- **Freezing:** when you change one region, freeze the untouched layers and fine-tune the
+  changed/adjacent ones first — it's cheaper and more stable. If accuracy doesn't recover,
+  unfreeze more (downstream layers were trained expecting the old behaviour).
+- Teacher targets are cached per sample (`.cache/teacher_targets/`), so the teacher runs
+  once per `(sample, FEATURE_TOKENS)`, not every step. Training uses a fixed canvas
+  (`prepare.TRAIN_HW`) so the cache is sound; geometry-changing augmentation desyncs it
+  (RGB-only jitter is fine).
 
-Proxy runs are short (`TRAIN_MINUTES≈20`) so you can rank ideas fast. When a config
-clearly wins, a **human** promotes it to a longer run by editing the frozen budget in
-`prepare.py` (raise `TRAIN_MINUTES`, enlarge the data subset) — the agent never does
-this itself. This mirrors autoresearch's "rank cheaply on short runs, scale the winner".
+## Warm-start (weight inheritance)
 
-## Warm-start (weight inheritance across iterations)
+`build_student()` warm-starts as a priority cascade (`WARM_START_FROM`, default `"best"`),
+highest priority applied last so it wins on name+shape overlap:
 
-Each experiment warm-starts as a priority cascade (`WARM_START_FROM` in `train.py`,
-default `"best"`): `fresh stock-DINOv2 < teacher decoder < best student so far`, higher
-priority winning on name+shape overlap. This matters because the teacher's 1024-d
-encoder can't load into the 384-d student — so **only the best student can warm-start
-the student encoder**, the main thing distillation teaches; otherwise every run
-re-distills the encoder from scratch. When you change one layer, that layer falls
-through to teacher/fresh while everything else inherits from the best student.
+```
+fresh (stock DINOv2)  <  teacher (encoder + decoder, all matching)  <  best student so far
+```
 
-Consequence: the search is cumulative (evolutionary), so a recipe-only tweak can look
-good just from inheriting a fine-tuned parent. Set `WARM_START_FROM="teacher"` for a
-clean fixed-init A/B when you need to isolate a change, and validate promoted winners
-from a fixed init.
+Because the seed is the teacher backbone, the teacher copy inherits the FULL teacher
+(encoder + decoder). As you shrink, only the changed layers stop matching; everything else
+keeps inheriting from the best student — which stays near-teacher accuracy, so it's a
+high-overlap source. This is why "load from best student" matters: a best student that is
+almost as accurate as the teacher is *like loading the teacher, but with far more of the
+weights actually transferable to your shrunk architecture*.
 
-## Suggested idea backlog (roughly cheap→deep)
+Set `WARM_START_FROM="teacher"` for a clean fixed-init A/B when you need to isolate a
+recipe change from the cumulative inheritance.
 
-1. **Fewer tokens** — lower `STUDENT_NUM_TOKENS_RANGE` / training `FEATURE_TOKENS`.
-   Token count is THE dominant cost (measured on the teacher, RTX2080ti: L0~128ms →
-   L9~307ms, a 2.4x range) and it's independent of input image resolution — the model
-   interpolates to a token grid set by `resolution_level` and aspect ratio. Only tiny
-   details are lost when lowering it (e.g. thin fence wires). `STUDENT_NUM_TOKENS_RANGE`
-   is the student's `resolution_level` mapping, so this is the fastest lever by far.
-   NB: `setup-baseline` prints the teacher's own level sweep — the student needs to beat
-   that curve, not just the slow level-9 point.
-2. **Smaller backbone** — `dinov2_vits14` (384-d, 12 layers) vs teacher L (1024, 24).
-   Lean hard on feature + decoder warm-start to recover accuracy.
-3. **Fewer `intermediate_layers`** taken from the backbone.
-4. **Feature-distillation recipe** — cosine vs L2 weighting, which layer(s) to match,
-   attention-transfer. (See ViTKD: matching the *right* features matters a lot.)
-5. **Slimmer neck/heads** — reduce `dim_res_blocks` / `num_res_blocks` in the config.
-6. **Token merging / pruning** inside the student forward (custom module).
-7. **Structured pruning / low-rank** of the warm-started encoder.
-8. Later (post-search, human): quantization, torch.compile, ONNX/TensorRT export.
+## Shrink axes (roughly, best transfer first)
+
+1. **Drop / merge transformer blocks** (24 → fewer). Kept blocks inherit teacher weights
+   directly. Highest transfer, biggest per-step speedup — start here.
+2. **Prune attention heads / MLP channels** with importance scoring; inherit the kept ones.
+3. **Narrow width** (structured pruning). Harder to inherit cleanly — real work.
+4. **Lighter neck/heads** (`dim_res_blocks`, `num_res_blocks`).
+5. **Token merging / pruning inside the encoder** (code in `student_model/`).
+6. Feature-distillation recipe: which layers to match, cosine vs L2, attention transfer.
+7. Big bets (budget-limited): a smaller backbone from a warm start — needs `--budget-min`.
 
 ## Log of what worked / didn't
 
-_(Append findings here as you go — one line each. This is your memory across
-iterations; the score CSV is the raw data, this is the interpretation.)_
+_(Append one line per experiment. This is your memory across iterations; results.csv is
+the raw data, this is the interpretation — especially "budget-limited, needs promotion".)_
 
-- (baseline) teacher: see `runs/teacher_baseline.json`.
+- (seed) student = teacher backbone, full inheritance → baseline ≈ teacher accuracy/speed;
+  first real move is a small shrink from here.

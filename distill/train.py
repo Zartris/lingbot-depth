@@ -6,8 +6,9 @@ Goal: distill the frozen teacher (LingBot-Depth ViT-L) into a student that is mu
 faster on our GPU while staying within the accuracy band defined in prepare.py.
 
 What you (the agent) may change here, freely:
-  * STUDENT_CONFIG / build_student() — backbone size, intermediate_layers,
-    num_tokens_range, neck & head widths.
+  * STUDENT_CONFIG / build_student() — backbone size, intermediate_layers, neck & head
+    widths. (num_tokens_range is FIXED to the teacher's — the resolution 0-9 dial is a
+    preserved user feature, not a search knob; see below.)
   * The distillation recipe — which losses (output / feature / gt), their weights,
     optimizer, LR schedule, augmentations, batch size, steps.
   * Anything else in THIS file.
@@ -51,8 +52,24 @@ from distill.prepare import (  # noqa: E402
 # --------------------------------------------------------------------------- #
 
 # --- student architecture --------------------------------------------------- #
-STUDENT_BACKBONE = "dinov2_vits14"     # vits14 (fastest) | vitb14 | vitl14
-STUDENT_NUM_TOKENS_RANGE = [900, 2400]  # fewer tokens than teacher [1200,3600] -> faster
+# The search STARTS AT THE TEACHER and shrinks incrementally (see program.md), so the
+# seed IS the teacher backbone — it inherits ~all teacher weights and starts at ~teacher
+# accuracy. You make the network smaller one small, weight-inheriting step at a time
+# (drop/merge blocks, prune heads/width — edit distill/student_model/), NOT by jumping
+# to a small backbone from scratch.
+STUDENT_BACKBONE = "dinov2_vitl14"     # start = teacher; shrink from here
+# The search space is OPEN — you MAY switch to a smaller backbone (vitb14/vits14) or any
+# other big change, isolated and tested. But a big low-transfer move (e.g. a fresh ViT-S
+# encoder) won't recover accuracy inside the default budget, so the proxy will reject it
+# regardless of its real potential; give such a bet a longer run with `--budget-min`
+# (see program.md). The DEFAULT path is incremental: shrink the teacher-sized net one
+# small, weight-inheriting step at a time (drop/merge blocks, prune heads/width).
+#
+# num_tokens_range is FIXED to the teacher's (None -> derive keeps the teacher's range).
+# The resolution_level 0-9 / token dial is a PRESERVED USER FEATURE, not a search knob:
+# you must NOT "win" by using fewer tokens (the user already chooses that at runtime, and
+# the score is measured ACROSS levels). Speedups must come from a cheaper-per-token net.
+STUDENT_NUM_TOKENS_RANGE = None
 
 # --- distillation recipe ---------------------------------------------------- #
 W_OUTPUT_DISTILL = 1.0     # match teacher refined depth (linear-space L1)
@@ -64,10 +81,12 @@ FEATURE_TOKENS = 1200      # token grid used during training (speed vs fidelity)
 LR = 2e-4
 WEIGHT_DECAY = 0.05
 BATCH_SIZE = 2
-WARM_START_DECODER = True  # copy teacher neck/heads into the student (big head start)
+INHERIT_TEACHER = True     # copy ALL matching teacher weights (encoder + decoder). At the
+                           # teacher-sized seed this inherits the FULL teacher; as you
+                           # shrink, whatever still matches by name+shape is inherited.
 # Where the student's initial weights come from, as a priority cascade (later wins on
-# name+shape overlap):  fresh(stock DINOv2) < teacher decoder < best student.
-#   "best"    -> inherit the best student so far (its distilled 384-d encoder + decoder),
+# name+shape overlap):  fresh(stock DINOv2) < teacher (all matching) < best student.
+#   "best"    -> inherit the best student so far (encoder + decoder),
 #                falling back to teacher decoder / fresh for anything that doesn't match.
 #                On iteration 1 (no best yet) this is identical to "teacher".
 #   "teacher" -> stock DINOv2 encoder + teacher decoder only (fixed init; clean A/B).
@@ -102,13 +121,13 @@ def build_student() -> "tuple[torch.nn.Module, dict]":
     last so it wins on name+shape overlap:
 
         fresh (stock DINOv2 encoder, via init_weights)
-          < teacher decoder (neck/heads copied where shapes match)
-            < best student so far (its distilled encoder + decoder, ALL matching tensors)
+          < teacher (encoder + decoder, ALL tensors that match by name+shape)
+            < best student so far (encoder + decoder, ALL matching tensors)
 
-    The teacher's 1024-d encoder can't load into the 384-d student, so best-student is
-    the only source that warm-starts the student encoder — which is the main thing
-    distillation teaches. On iteration 1 there is no best yet, so this reduces to the
-    fixed teacher-decoder init.
+    Because the seed IS the teacher backbone, the teacher copy inherits the FULL teacher
+    (encoder + decoder) -> the student starts at ~teacher accuracy. As you shrink the net,
+    only the changed layers stop matching; the rest keep inheriting from the best student
+    (which stays near-teacher accuracy, so it's a high-overlap source) or the teacher.
     """
     from distill.student_model.v2 import MDMModel as StudentMDMModel
 
@@ -120,10 +139,9 @@ def build_student() -> "tuple[torch.nn.Module, dict]":
     student.init_weights()  # base: encoder <- stock DINOv2, everything else fresh
 
     n_teacher = n_best = 0
-    if WARM_START_FROM in ("best", "teacher") and WARM_START_DECODER:
+    if WARM_START_FROM in ("best", "teacher") and INHERIT_TEACHER:
         n_teacher = _copy_matching(
-            student, load_teacher().state_dict(),
-            prefixes=("neck.", "depth_head.", "mask_head.", "scale_head."))
+            student, load_teacher().state_dict(), prefixes=None)  # ALL matching (enc+dec)
     if WARM_START_FROM == "best":
         best = prepare.best_student_ckpt()
         if best is not None:
