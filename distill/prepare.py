@@ -109,11 +109,12 @@ N_EVAL_REAL = 0
 # ---- Compute budget per experiment (FROZEN) ----------------------------------
 # Equal compute per run => comparable scores (autoresearch's fixed-budget premise).
 # The agent optimises what to do WITHIN this budget, not the budget itself.
-TRAIN_MINUTES = 90.0          # default per-iteration budget. High-transfer (incremental)
-                              # changes are judged fairly at this budget; big low-transfer
-                              # jumps (e.g. a fresh small backbone) still won't be — give
-                              # those a longer run with `--budget-min` (see program.md).
+TRAIN_MINUTES = 90.0          # DEFAULT per-iteration budget when the agent doesn't set one.
 MAX_STEPS = 1_000_000         # step cap (time is the real limit)
+# The agent rates how big a change it is testing and sets its own budget (train.BUDGET_MINUTES
+# or --budget-min): budget TO CONVERGENCE, longer for big low-transfer changes. This is a
+# frozen safety ceiling so a single experiment can't run away with the GPU. Raise if needed.
+MAX_BUDGET_MINUTES = 480.0    # 8 h hard cap per experiment
 
 # ---- Teacher-target cache ----------------------------------------------------
 # The ViT-L teacher is expensive; caching its per-sample outputs turns the inner loop

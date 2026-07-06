@@ -61,15 +61,18 @@ Consequences you must internalise:
 ## What you may edit
 - `distill/train.py` — student config + the distillation recipe: `STUDENT_BACKBONE`,
   `intermediate_layers`, neck/head widths; losses & weights (`W_OUTPUT_DISTILL`,
-  `W_FEATURE_DISTILL`, `W_GT`), optimiser, LR schedule, `BATCH_SIZE`, sampling, and which
-  layers to **freeze**. (NOT `num_tokens_range` — fixed to the teacher's.)
+  `W_FEATURE_DISTILL`, `W_GT`), optimiser, LR schedule, `BATCH_SIZE`, sampling, which
+  layers to **freeze**, and `BUDGET_MINUTES` (how long THIS experiment trains — see
+  Budget). (NOT `num_tokens_range` — fixed to the teacher's.)
 - `distill/student_model/` — the MUTABLE copy of the network. Edit the architecture here:
   drop/merge blocks, prune heads, narrow dims, token merging, fused ops. This is where
   structural speedups live.
 
 ## What you may NOT edit
 - `distill/prepare.py` — data, teacher, metrics, latency, **objective**, the eval set, and
-  the budget. Frozen. It is your exam; you cannot change how you're graded.
+  the budget DEFAULT + safety CAP (`MAX_BUDGET_MINUTES`). Frozen — it is your exam; you
+  cannot change how you're graded. (You DO set your own per-run budget within the cap via
+  `train.BUDGET_MINUTES` — see Budget.)
 - the `mdm/` package — the frozen teacher. Editing it corrupts your targets and reference.
 
 **Hard contract:** whatever `build_student()` returns MUST expose
@@ -82,11 +85,12 @@ supervise it in LINEAR space; a log-space loss lets it drift negative).
 You MAY try anything — including a smaller backbone (`vitb14`/`vits14`) or a radical
 restructure. Two rules:
 1. **One isolated change per iteration**, so its effect is attributable.
-2. A **big low-transfer change won't be judged fairly by the default budget** — it will be
-   rejected because it can't recover accuracy in time, not because it's a bad idea. If you
-   believe a big bet is worth it, it needs a longer run: a human gives it one with
-   `--budget-min`. Don't let a single rejected proxy run convince you a big idea is dead;
-   note it in the log as "budget-limited, needs promotion."
+2. A **big low-transfer change won't converge in the default budget** — it would be
+   rejected because it can't recover accuracy in time, not because it's a bad idea. So
+   when you make a big change, **raise its budget yourself** (`BUDGET_MINUTES` /
+   `--budget-min`, up to the cap) to give it a fair, converged shot — that's your call to
+   make, weighing the compute cost. Don't let a too-short run convince you a big idea is
+   dead; note "budget-limited" in the log.
 
 ## The loop
 
@@ -99,9 +103,15 @@ python -m distill.run --setup-baseline --hf     # ONCE: measure the teacher + it
 #   4. read the score; append a one-line finding to the Log below; repeat
 ```
 
-- **Budget: `TRAIN_MINUTES = 90` per iteration** (frozen). Enough to judge incremental,
-  high-transfer changes fairly. For a big bet, a human runs `--budget-min <N>` to give it
-  more time — you cannot change the frozen budget yourself.
+- **Budget: YOU set it.** Rate how big your change is and budget TO CONVERGENCE — set
+  `BUDGET_MINUTES` in `train.py` (or pass `--budget-min <N>`). Small high-transfer change
+  (drop a block) → leave it (default 90 min). Big low-transfer change (fresh smaller
+  backbone) → raise it, up to the frozen safety cap `prepare.MAX_BUDGET_MINUTES` (8 h).
+  Budget to convergence, **not beyond**: over-budgeting a change that has already plateaued
+  just burns compute AND confounds the comparison with shorter runs (a longer run can
+  score better purely from more training). The effective budget is logged in results.csv,
+  so size it honestly. When a big change looks promising under a long budget, re-run the
+  current champion at the SAME budget for a clean apples-to-apples comparison.
 - **Freezing:** when you change one region, freeze the untouched layers and fine-tune the
   changed/adjacent ones first — it's cheaper and more stable. If accuracy doesn't recover,
   unfreeze more (downstream layers were trained expecting the old behaviour).

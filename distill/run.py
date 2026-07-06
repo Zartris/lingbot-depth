@@ -171,6 +171,7 @@ def one_iteration(accept: bool, use_hf: bool, minutes: float = None,
     res = prepare.score_student(student, _eval_set(use_hf), base, teacher=prepare.load_teacher())
 
     row = {"run_id": run_id, "backbone": train.STUDENT_BACKBONE,
+           "budget_min": round(train.resolve_budget(minutes), 2),
            **{k: round(v, 5) for k, v in res.items()}}
     _append_result(row)
 

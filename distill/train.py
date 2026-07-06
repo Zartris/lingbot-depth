@@ -77,6 +77,17 @@ W_FEATURE_DISTILL = 1.0    # match teacher encoder features (via a learned 1x1 p
 W_GT = 0.5                 # supervise on real ground-truth depth where available
 FEATURE_TOKENS = 1200      # token grid used during training (speed vs fidelity)
 
+# --- budget: YOU rate the change and set the time ---------------------------- #
+# Rate how big a change this experiment is and budget TO CONVERGENCE (until the loss /
+# accuracy plateaus), not beyond:
+#   * small, high-transfer change (drop a block, prune heads) -> converges fast; leave
+#     None (uses the default prepare.TRAIN_MINUTES = 90).
+#   * big, low-transfer change (e.g. a fresh smaller backbone) -> needs much longer to
+#     show its real potential; raise this, up to prepare.MAX_BUDGET_MINUTES (8 h cap).
+# Over-budgeting a converged change just burns compute AND confounds comparison with
+# shorter runs — size it honestly. The effective budget is logged in results.csv.
+BUDGET_MINUTES = None      # None -> prepare.TRAIN_MINUTES; else minutes for THIS experiment
+
 # --- optimisation ----------------------------------------------------------- #
 LR = 2e-4
 WEIGHT_DECAY = 0.05
@@ -246,11 +257,19 @@ def distill_step(student, teacher, samples, dev, feat_proj=None) -> Dict[str, to
 #  Train                                                                        #
 # --------------------------------------------------------------------------- #
 
+def resolve_budget(minutes: float = None) -> float:
+    """Effective training budget (minutes) for a run, clamped to the frozen safety cap.
+    Precedence: explicit `minutes` (CLI --budget-min) > BUDGET_MINUTES knob > default."""
+    b = minutes if minutes is not None else (
+        BUDGET_MINUTES if BUDGET_MINUTES is not None else prepare.TRAIN_MINUTES)
+    return min(float(b), prepare.MAX_BUDGET_MINUTES)
+
+
 def main(run_dir: Path, use_hf: bool = False,
          minutes: float = None, max_steps: int = None) -> Path:
-    # `minutes`/`max_steps` override the frozen budget for a quick TEST RUN only
-    # (passed by the runner, never by the agent). Default None -> the frozen budget.
-    budget_min = prepare.TRAIN_MINUTES if minutes is None else minutes
+    # Budget: the agent rates the change and sets BUDGET_MINUTES (or a human/CLI passes
+    # --budget-min); clamped to prepare.MAX_BUDGET_MINUTES. See the BUDGET_MINUTES knob.
+    budget_min = resolve_budget(minutes)
     budget_steps = prepare.MAX_STEPS if max_steps is None else max_steps
 
     torch.manual_seed(prepare.SEED)
