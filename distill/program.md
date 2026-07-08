@@ -97,6 +97,28 @@ restructure. Two rules:
    make, weighing the compute cost. Don't let a too-short run convince you a big idea is
    dead; note "budget-limited" in the log.
 
+## Setup — do this once when a run starts
+
+Adapted from autoresearch's setup to our harness:
+
+1. **Branch — never `main`.** All work happens on a long-lived research branch (currently
+   `worktree-distill-scaffold`). Unlike vanilla autoresearch (a fresh `autoresearch/<tag>`
+   branch per run that you *advance*), here each ACCEPTED experiment is a commit on this
+   branch, so the branch history IS the champion lineage. Starting a brand-new run? Branch
+   from the current champion, not from `main`.
+2. **Read the in-scope files:** this file, `STATUS.md`, `distill/prepare.py` (your frozen
+   exam — read it to know how you're graded, never edit it), and `distill/train.py` +
+   `distill/student_model/` (what you edit).
+3. **Environment:** a Blackwell-class GPU needs torch 2.11+cu128 + xformers 0.0.35 (the
+   repo's pins predate Blackwell). Run from the repo root with `XFORMERS_DISABLED` UNSET —
+   it hard-disables the required nested-tensor path and the model won't run. See STATUS.md.
+4. **Verify data / baseline:** run `python -m distill.run --setup-baseline --hf` ONCE. It
+   measures the teacher + per-level curve and writes `runs/teacher_baseline.json` (the
+   accuracy anchor). The first call streams ~6 GB of real eval, then caches it. Iterations
+   refuse to run without this baseline.
+5. **Confirm the seed, then go:** run one iteration UNCHANGED — it should score ~teacher
+   (excess ≈ 0). That is the champion to beat. Then start shrinking.
+
 ## The loop
 
 ```
@@ -124,6 +146,43 @@ python -m distill.run --setup-baseline --hf     # ONCE: measure the teacher + it
   once per `(sample, FEATURE_TOKENS)`, not every step. Training uses a fixed canvas
   (`prepare.TRAIN_HW`) so the cache is sound; geometry-changing augmentation desyncs it
   (RGB-only jitter is fine).
+
+### Launching a run and reading it
+- Launch redirected — do NOT `tee` or let training output flood your context:
+  `python -m distill.run --hf --accept > run.log 2>&1`. Then read only the outcome:
+  `grep "^\[run\] score=" run.log` (score, mean_latency, speedup, mean_absrel, min_delta1,
+  params) and `grep -E "IMPROVED|no improvement" run.log`.
+- `runs/results.csv` gets exactly ONE row per run: `run_id, backbone, budget_min, score,
+  params, mean_latency_ms, mean_absrel, min_delta1, speedup_vs_teacher`. Read it at the
+  start of every iteration — it's the raw history of what's been tried and what scored.
+
+### Keep-or-revert — our harness only auto-KEEPS (read carefully)
+`--accept` commits (`train.py` + `student_model/` + `results.csv`) **and** promotes the
+champion (`distill/best/`) ONLY when the score improves on the best so far. On a REJECTED
+run it commits nothing — **but your working-tree edits stay.** There is no auto-`git
+reset`. So YOU must revert a rejected change before the next one, or edits pile up and
+"one isolated change" silently breaks:
+```
+git checkout -- distill/train.py distill/student_model   # discard a rejected change
+```
+Revert ONLY those two paths — leave `results.csv` alone (its freshly-appended row is your
+memory of the failed attempt; it's uncommitted, keep it). To deliberately BUILD ON a
+rejected change instead of reverting, keep it and note in the Log that the next recorded
+score bundles both edits.
+
+### Timeout / kill (hang guard)
+The budget stops *training* on a wall clock inside `train.py`, but a bad edit can still
+hang (infinite loop, a wedged eval or stream). Launch each run under an external guard of
+~2× your budget + ~10 min overhead, e.g. for a 45-min budget:
+```
+timeout 100m python -m distill.run --hf --accept > run.log 2>&1
+```
+If it gets killed, treat it as a crash: revert (above) and move on.
+
+### Crashes — use judgment
+Dumb and easy (typo, missing import, an obvious shape mismatch you can fix) → fix and
+re-run. Fundamentally broken idea → skip it, revert, and log one line as a "crash" in the
+Log below so you don't retry it. Don't sink a whole session into resurrecting a bad idea.
 
 ## Warm-start (weight inheritance)
 
@@ -162,3 +221,9 @@ the raw data, this is the interpretation — especially "budget-limited, needs p
 
 - (seed) student = teacher backbone, full inheritance → baseline ≈ teacher accuracy/speed;
   first real move is a small shrink from here.
+- 2026-07-08: run 20260708-100812 (1-min seed check) logged latency 4.7x WORSE than teacher
+  at L9 (844 vs 179 ms) — FALSE ALARM: interleaved re-benchmark (teacher/student/teacher/
+  student, one process) gives 177 vs 177 ms (1.00x). The run's latency was contaminated
+  (GPU contention/thermal during that session). Lesson: treat single-run latency swings
+  with suspicion; re-benchmark interleaved before believing a big latency delta. Its
+  score 420.97 is latency-inflated but its accuracy row is valid (mean_absrel 0.0394 ≈ teacher).
