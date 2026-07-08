@@ -98,13 +98,26 @@ RESOLUTION_SWEEP = [0, 3, 6, 9]
 # The same training pool and the same eval set for EVERY experiment. Frozen here so
 # a score difference reflects a better student, not more/different data, and so the
 # agent can never change what it is scored on (the eval set is its exam).
-# Sim by default (RobbySimVal has perfect GT and streams cheaply). Real shards are
-# wired but default to 0 — their modality-grouped layout has a ~3 GB/camera streaming
-# floor, so enable real deliberately (set N_*_REAL > 0) once you accept that cost.
+# Sim (RobbySimVal, perfect GT) + real (RobbyReal, physical Orbbec sensor). Real is
+# weighted higher in the accuracy term (ACC_WEIGHT_REAL) because it is the deployment
+# target; its GT has sensor holes, which depth_metrics() masks out (gt>MIN_DEPTH).
+# COST/DIVERSITY (measured by probing the shards): the real shard is modality-grouped
+# per camera, so the first complete (rgb,raw,gt) triplet closes ~1.0 GB in, and every
+# gtdepth frame after that completes another — so the first ~1776 real triplets all come
+# from ONE camera/room (streamed once, cached to disk). Cheap, but the real split is a
+# SINGLE SCENE. To diversify, stream deeper (~1.2 GB per additional camera) and raise
+# these counts; the disk cache makes re-runs free.
 N_TRAIN_SIM = 1200
-N_TRAIN_REAL = 0
+N_TRAIN_REAL = 400
 N_EVAL_SIM = 100
-N_EVAL_REAL = 0
+N_EVAL_REAL = 100
+# Real diversity: spread the real samples across this many distinct cameras/scenes
+# instead of taking them all from the first one. The reader caps each camera at
+# ceil(N_REAL / cameras) frames, then skips to the next camera. Costs ~1.2 GB streamed
+# per camera (modality-grouped layout), one-time (cached). More cameras = more scene
+# diversity in the real signal; raise if you can spare the one-time stream.
+N_TRAIN_REAL_CAMERAS = 5      # -> 80 frames each from 5 train scenes (batch_0002)
+N_EVAL_REAL_CAMERAS = 5       # -> 20 frames each from 5 eval scenes (batch_0001)
 
 # ---- Compute budget per experiment (FROZEN) ----------------------------------
 # Equal compute per run => comparable scores (autoresearch's fixed-budget premise).
@@ -343,11 +356,15 @@ SHARDS: Dict[str, Tuple[Any, str]] = {
 }
 
 # Which shards feed which split. Train and eval use DIFFERENT shards -> guaranteed
-# disjoint. Real shards are wired but default to 0 samples (N_*_REAL): their
-# modality-grouped layout means ~3 GB must be streamed per camera before the first
-# triplet completes, so enable real deliberately once you accept that cost.
+# disjoint (real: eval=batch_0001, train=batch_0002; a different camera/room each, so
+# no scene leaks train->eval). Modality-grouped layout: ~1.0 GB streams to the first
+# triplet, then it's cheap; the reader stages members to disk so RAM stays flat.
 EVAL_SIM_SHARD, EVAL_REAL_SHARD = "RobbySimVal_batch_0001.tar.zst", "RobbyReal_batch_0001.tar.zst"
 TRAIN_SIM_SHARD, TRAIN_REAL_SHARD = "RobbySim_object_view_batch_0001.tar.zst", "RobbyReal_batch_0002.tar.zst"
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return -(-a // max(1, b))
 
 
 def _cached_sample_dirs(dest: Path) -> List[Path]:
@@ -355,10 +372,16 @@ def _cached_sample_dirs(dest: Path) -> List[Path]:
                   if p.is_dir() and p.name != "_staging" and (p / "rgb").exists())
 
 
-def _stream_shard_samples(shard: str, n: int, cache_subdir: str) -> List[Path]:
-    """Stream `shard`, extract the first `n` complete (rgb, raw, gt) triplets to a disk
-    cache, and return their directories. Disk-buffered via a staging dir, so the
-    modality-grouped real shards don't blow up RAM. Cached, so re-runs are free."""
+def _stream_shard_samples(shard: str, n: int, cache_subdir: str,
+                          per_group_cap: Optional[int] = None) -> List[Path]:
+    """Stream `shard`, extract `n` complete (rgb, raw, gt) triplets to a disk cache, and
+    return their directories. Disk-buffered via a staging dir, so the modality-grouped
+    real shards don't blow up RAM. Cached, so re-runs are free.
+
+    `per_group_cap` (real shards): take at most this many frames per camera/scene, then
+    skip the rest of that camera and move on -> spreads the samples across cameras for
+    diversity. The camera key is the sample stem minus its frame id. When None, takes the
+    first `n` triplets in stream order (fine for the interleaved sim shards)."""
     if n <= 0:
         return []
     import requests, zstandard, tarfile, shutil
@@ -375,8 +398,12 @@ def _stream_shard_samples(shard: str, n: int, cache_subdir: str) -> List[Path]:
     staging = dest / "_staging"
     staging.mkdir(exist_ok=True)
     seen: Dict[str, set] = {}
+    sid_group: Dict[str, str] = {}       # sid -> camera key (only tracked when capping)
+    group_done: Dict[str, int] = {}      # camera key -> triplets completed
+    capped: set = set()                  # cameras that hit per_group_cap
     complete = list(ready)
-    print(f"[data] streaming {shard} for {n - len(complete)} more '{domain}' samples -> {dest}")
+    cap_msg = f" ({per_group_cap}/camera)" if per_group_cap else ""
+    print(f"[data] streaming {shard} for {n - len(complete)} more '{domain}' samples{cap_msg} -> {dest}")
 
     with requests.get(f"{HF_RESOLVE}/{shard}", stream=True, timeout=(30, 300)) as r:
         r.raise_for_status()
@@ -394,11 +421,16 @@ def _stream_shard_samples(shard: str, n: int, cache_subdir: str) -> List[Path]:
             if pk is None:
                 continue
             stem, kind = pk
+            group = stem.rsplit("/", 1)[0] if per_group_cap else None
+            if group is not None and group in capped:
+                continue                 # this camera is full — skip its remaining members
             sid = _safe_key(stem)
             if (dest / sid).is_dir():
                 continue
             (staging / f"{sid}.{kind}").write_bytes(tar.extractfile(m).read())
             seen.setdefault(sid, set()).add(kind)
+            if group is not None:
+                sid_group[sid] = group
             if {"rgb", "raw", "gt"} <= seen[sid]:
                 sdir = dest / sid
                 sdir.mkdir()
@@ -407,9 +439,21 @@ def _stream_shard_samples(shard: str, n: int, cache_subdir: str) -> List[Path]:
                 (sdir / "domain").write_text(domain)
                 complete.append(sdir)
                 del seen[sid]
+                if group is not None:
+                    group_done[group] = group_done.get(group, 0) + 1
+                    if group_done[group] >= per_group_cap:
+                        capped.add(group)
+                        # drop this camera's staged-but-incomplete leftovers so the
+                        # ~1 GB of buffered rawdepth+color doesn't pile up across cameras
+                        for other in [s for s, g in sid_group.items() if g == group and s in seen]:
+                            for k in seen.pop(other):
+                                (staging / f"{other}.{k}").unlink(missing_ok=True)
                 if len(complete) >= n:
                     break
-    print(f"[data] {shard}: {len(complete)} samples ready")
+    if per_group_cap:
+        print(f"[data] {shard}: {len(complete)} samples ready across {len(group_done)} cameras")
+    else:
+        print(f"[data] {shard}: {len(complete)} samples ready")
     return complete[:n]
 
 
@@ -445,7 +489,8 @@ def train_dataset(use_hf: bool = True):
     if not use_hf:
         return LocalExamplesDataset()
     dirs = (_stream_shard_samples(TRAIN_SIM_SHARD, N_TRAIN_SIM, "train_sim")
-            + _stream_shard_samples(TRAIN_REAL_SHARD, N_TRAIN_REAL, "train_real"))
+            + _stream_shard_samples(TRAIN_REAL_SHARD, N_TRAIN_REAL, "train_real",
+                                    per_group_cap=_ceil_div(N_TRAIN_REAL, N_TRAIN_REAL_CAMERAS)))
     return ShardDataset(dirs)
 
 
@@ -455,7 +500,8 @@ def eval_dataset(use_hf: bool = True):
     if not use_hf:
         return LocalExamplesDataset()
     dirs = (_stream_shard_samples(EVAL_SIM_SHARD, N_EVAL_SIM, "eval_sim")
-            + _stream_shard_samples(EVAL_REAL_SHARD, N_EVAL_REAL, "eval_real"))
+            + _stream_shard_samples(EVAL_REAL_SHARD, N_EVAL_REAL, "eval_real",
+                                    per_group_cap=_ceil_div(N_EVAL_REAL, N_EVAL_REAL_CAMERAS)))
     return ShardDataset(dirs)
 
 

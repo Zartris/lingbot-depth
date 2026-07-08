@@ -87,9 +87,10 @@ change looks promising, re-run the champion at the SAME budget for a clean A/B.
 
 - **Environment:** needs a Blackwell-compatible stack (torch 2.11+cu128, xformers 0.0.35,
   requests, zstandard) — the repo's pins predate Blackwell. See `STATUS.md`.
-- **Data is sim-only** right now (`N_*_REAL=0`); real (`RobbyReal`) is wired but off
-  (unverified layout + unreliable unauthenticated streaming). Enabling real is the
-  highest-value data step — see `STATUS.md`.
-- **Accuracy-first steering is deliberate:** the sim teacher is near-perfect, so the
-  objective is accuracy-dominated. If you later loosen the band / re-weight, revisit the
-  "first moves" emphasis.
+- **Data is sim + real** (both on). Sim (`RobbySimVal`, perfect GT) + real (`RobbyReal`,
+  physical Orbbec, weighted 0.7 in accuracy). Real is spread across 5 cameras/split for
+  diversity (~1.2 GB streamed per camera, one-time, cached). To widen the real exam, raise
+  `N_*_REAL_CAMERAS` in `prepare.py` — see `STATUS.md`.
+- **Accuracy-first steering is deliberate.** With real on, the teacher anchor is a
+  realistic ~0.04 AbsRel (not the near-perfect ~0.006 of sim-only), so the 0.01 band is
+  genuinely reachable and the objective is well-balanced.

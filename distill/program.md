@@ -55,6 +55,11 @@ Consequences you must internalise:
   already chooses it at runtime. `num_tokens_range` is fixed to the teacher's. Real
   speedups must make the network *cheaper per token* (fewer layers/heads/width), not use
   fewer tokens.
+- **`AbsRel` is domain-weighted (real 0.7, sim 0.3)** — the exam is both simulated
+  (`RobbySimVal`, perfect GT) and real (`RobbyReal`, physical Orbbec sensor; GT holes are
+  masked out). Real is weighted higher because it is the deployment target, so a change
+  that helps sim but hurts real will usually *lose*. Real is drawn from 5 cameras/scenes
+  per split — decent signal, limited diversity (see STATUS.md).
 - **Latency is measured at batch size 1** (one camera frame) and is noisy on this GPU —
   prefer changes that also cut **params/FLOPs** (deterministic, portable), logged for you.
 

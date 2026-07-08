@@ -23,7 +23,9 @@ student. Full detail is in `program.md` (the agent's manual). Key decisions:
   budget-limited: the proxy will reject them unfairly. Default budget `TRAIN_MINUTES=90`;
   give a big bet a longer run with `--budget-min <N>`. No stop — runs forever.
 
-✅ **GPU-re-validated** (found + fixed 2 bugs while doing it):
+✅ **GPU-re-validated** (found + fixed 2 bugs while doing it; curve numbers below are
+from the earlier sim-only anchor — the live anchor is now sim+real, see the dataset
+section: L0 absrel_w 0.041 → L9 0.037):
 - Teacher per-level curve is sane (L0: 61ms/absrel 0.0082 → L9: 179ms/0.0063).
 - **Seed reproduces the teacher exactly** (excess = -0.0000, speedup 1.00x, feat loss
   literally 0) — "start at teacher" works.
@@ -70,22 +72,36 @@ the path.
 stream it, zstd-decompress on the fly, and pull the first N complete `(rgb, raw, gt)`
 triplets off the front (disk-buffered, cached in `.cache/shards/`).
 
-Verified internal layouts (parsers in `prepare.py`):
+Verified internal layouts (parsers in `prepare.py`), all **confirmed by probing**:
 
 | shard family | rgb | raw | gt | ordering |
 |---|---|---|---|---|
 | `RobbySimVal` | `_rgb.left.jpg` | `_rawdepth.left.png` | `_depth_left.png` | interleaved (cheap) |
 | `RobbySim_*_view` | `_left.jpg` | `_rmd2c.png` | `_depth.png` | interleaved (cheap) |
-| `RobbyReal` | `color/…` | `rawdepth/…` | `gtdepth/…` | **grouped by modality** |
+| `RobbyReal` | `color/…jpg` | `rawdepth/…png` | `gtdepth/…png` | **grouped by modality** |
 
-**Default = sim** (`N_*_REAL = 0`). RobbySimVal has *perfect* GT and streams cheaply.
-Real is wired but off by default because its modality-grouped layout means ~3 GB must
-be streamed per camera before the first triplet completes.
+**Both domains are now ON.** Sim (`RobbySimVal`, perfect GT) + real (`RobbyReal`,
+physical Orbbec sensor, GT has holes → masked by `gt>MIN_DEPTH` in `depth_metrics`).
+Counts (each = one camera frame / triplet):
 
-⚠️ Two things about real still UNVERIFIED:
-1. The `color` / `gtdepth` dir names are assumed (I only observed `rawdepth/` when
-   streaming). Confirm before enabling real.
-2. The `_rmd2c.png` = "raw depth" mapping for sim-train is inferred by elimination.
+| split | sim | real | real cameras |
+|---|---|---|---|
+| train | `N_TRAIN_SIM=1200` | `N_TRAIN_REAL=400` | `N_TRAIN_REAL_CAMERAS=5` (80 each) |
+| eval  | `N_EVAL_SIM=100`   | `N_EVAL_REAL=100`  | `N_EVAL_REAL_CAMERAS=5` (20 each) |
+
+**Real layout & cost (measured by probing both shards):** modality-grouped per camera —
+all `rawdepth` then all `color` then `gtdepth` (~1776 frames each). The first complete
+triplet closes ~1.0 GB in; every `gtdepth` frame after that completes another. So the
+reader streams ~1.2 GB **per camera** (one-time, cached to `.cache/shards/`) and takes a
+per-camera cap (`ceil(N_REAL/cameras)`), skipping to the next camera to spread the
+samples across scenes. Eval=batch_0001, train=batch_0002 (different rooms → no leak).
+
+⚠️ **Diversity note:** more cameras = more honest real accuracy. The teacher's real
+absrel was **0.019 from the single first camera but 0.049 across 5** — the first scene
+was optimistically easy. Raising `N_*_REAL_CAMERAS` costs ~1.2 GB streamed each,
+one-time; do it if you can spare the download and want a broader real exam.
+
+Note: `_rmd2c.png` = sim-train "raw depth" is still inferred by elimination (works).
 
 ## Last validated
 
@@ -102,15 +118,16 @@ be streamed per camera before the first triplet completes.
 ## Next steps, in order
 
 1. `python -m distill.run --setup-baseline --hf`
-   → regenerate `runs/teacher_baseline.json` (validated; ~fast, samples cached).
+   → regenerate `runs/teacher_baseline.json` (validated; real samples cached after first).
 2. `python -m distill.run --test-run --hf`
-   → tiny end-to-end on streamed real (sim) data with GT loss.
-3. A real iteration: `python -m distill.run --hf` (20 min), sanity-check the score,
-   then `--compare` (teacher vs best across resolution levels).
-4. Probe a `RobbyReal` shard to confirm `color`/`gtdepth` dir names; if good, enable
-   real (`N_*_REAL > 0` in `prepare.py`) and accept the streaming floor.
-5. Hand to auto-research: the agent edits `train.py` / `student_model/`, loop with
+   → tiny end-to-end on streamed sim+real data with GT loss.
+3. A real iteration: `python -m distill.run --hf`, sanity-check the score, then
+   `--compare` (teacher vs best across resolution levels).
+4. Hand to auto-research: the agent edits `train.py` / `student_model/`, loop with
    `--hf --accept`.
+
+(Done: real domain enabled — dir names confirmed by probe, sim+real both on, real
+spread across 5 cameras/split. See the dataset section.)
 
 ## Ready for auto-research? YES — validated end-to-end, two real bugs found & fixed
 
@@ -138,16 +155,18 @@ ZERO gradient, so the student drifted to negative depth. Fix: `_depth_l1` is now
 L1, which penalises negatives directly. Also eval now uses `apply_mask=False` so a
 student can't inflate its score by masking the pixels it gets wrong.
 
-**Tuning note (not a blocker):** the sim teacher is near-perfect (absrel 0.0063), so the
-accuracy tolerance is essentially unreachable and the objective is accuracy-dominated
-(scores are large, ~1e5). Ordering is correct (better student → lower score), so the
-research signal is valid; may want to loosen `ACC_TOLERANCE` / cap the absrel violation
-later. Also the mask head is NOT distilled (no mask loss) — fine for scoring
-(apply_mask=False), but add a mask loss if deployment needs the confidence mask.
+**Tuning note (largely resolved by enabling real).** Sim-only, the teacher was
+near-perfect (absrel ~0.006) so the 0.01 band was ~unreachable and the objective was
+accuracy-saturated. With real ON, the weighted teacher anchor is a realistic
+~0.037–0.041 absrel, so the band sits on a floor a student can actually trade against —
+the objective is now meaningfully balanced. Ordering was always correct; this just makes
+the gradient of the reward usable. (Still: the mask head is NOT distilled — fine for
+scoring with `apply_mask=False`, but add a mask loss if deployment needs the mask.)
 
 ## Known gaps / watch-list
 
-- Real (RobbyReal) domain is off by default; dir names unverified (see above).
+- **Real is a limited-diversity exam**: 5 cameras/split (~5 scenes), one shard each.
+  Real *signal*, not broad coverage — raise `N_*_REAL_CAMERAS` (~1.2 GB/camera) to widen.
 - **Cross-machine scores aren't comparable** (latency is GPU-specific). Ranking stays
   machine-local (`runs/results.csv`); the committed champion (`distill/best/`, fp16,
   no LFS) records its `gpu` in `best.json` — re-benchmark it locally elsewhere.
