@@ -29,6 +29,12 @@ distillation / progressive-COMPRESSION task, NOT a from-scratch rewrite.
 Scored ACROSS resolution levels [0,3,6,9]:
   - accuracy is measured vs the TEACHER at the same level (fixed anchor — NEVER the best
     student, or the bar ratchets down and students drift worse).
+  - AbsRel is domain-weighted: REAL 0.7 + SIM 0.3. The exam is both simulated
+    (RobbySimVal, perfect GT) and real (RobbyReal, physical sensor; GT holes masked).
+    Real is weighted higher because it is the deployment target, so a change that helps
+    sim but hurts real will usually LOSE. Real spans 5 cameras/split (decent signal,
+    limited diversity). The teacher anchor is ~0.037-0.041 AbsRel, so the 0.01 band is
+    real headroom you can trade against — do not squander it.
   - degenerate output (no usable depth) -> worst score.
   - AbsRel worse than the teacher by > 0.01 at any level -> rejected.
   - otherwise score = W_SPEED*mean_latency + W_ACC*mean(AbsRel excess), W_ACC >> W_SPEED,
@@ -58,6 +64,7 @@ change looks promising, re-run the champion at the SAME budget for a clean A/B.
 
 ## The loop
   python -m distill.run --setup-baseline --hf   # ONCE: teacher baseline + per-level curve
+                                                # (first run streams ~6 GB real eval, then cached)
   # each iteration:
   #  1. read distill/runs/results.csv + program.md's Log
   #  2. make ONE isolated change (train.py and/or student_model/), form a hypothesis
