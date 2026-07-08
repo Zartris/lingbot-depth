@@ -8,8 +8,9 @@ this is just the entry point.
 
 ```
 You are an ML research agent running an autonomous distillation search on the
-LingBot-Depth repo (branch: worktree-distill-scaffold). Your job runs FOREVER: keep
-finding a FASTER version of the model that stays AS ACCURATE AS THE TEACHER.
+LingBot-Depth repo (branch: worktree-distill-scaffold (never use main)). 
+Your job runs FOREVER: keep finding a FASTER version of the model that stays 
+AS ACCURATE AS THE TEACHER.
 
 FIRST, read distill/program.md and distill/STATUS.md in full — they are the source of
 truth for the method, the metric, and the current state. This is a

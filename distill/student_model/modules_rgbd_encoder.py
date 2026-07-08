@@ -20,10 +20,11 @@ class DINOv2_RGBD_Encoder(nn.Module):
     image_std: torch.Tensor
     dim_features: int
 
-    def __init__(self, backbone: str, intermediate_layers: Union[int, List[int]], dim_out: int, ignore_layers: Union[str, List[str]]=[], in_chans: int=3, strict: bool=True, img_depth_fuse_mode='', depth_emb_mode='', depth_mask_ratio=0.6, img_mask_ratio=0.0, **deprecated_kwargs):
+    def __init__(self, backbone: str, intermediate_layers: Union[int, List[int]], dim_out: int, ignore_layers: Union[str, List[str]]=[], in_chans: int=3, strict: bool=True, img_depth_fuse_mode='', depth_emb_mode='', depth_mask_ratio=0.6, img_mask_ratio=0.0, drop_block_indices: Optional[List[int]]=None, **deprecated_kwargs):
         super(DINOv2_RGBD_Encoder, self).__init__()
 
         self.intermediate_layers = intermediate_layers
+        self.drop_block_indices = sorted(drop_block_indices) if drop_block_indices else []
         self.strict = strict
         self.ignore_layers = ignore_layers
         self.img_mask_ratio = img_mask_ratio
@@ -37,7 +38,16 @@ class DINOv2_RGBD_Encoder(nn.Module):
                                         depth_mask_ratio=depth_mask_ratio, 
                                         img_mask_ratio=img_mask_ratio)
         
-        self.dim_features = self.backbone.blocks[0].attn.qkv.in_features
+        # Structural block-drop: replace listed transformer blocks with Identity AFTER
+        # construction, keeping the surviving blocks' module names/indices unchanged so
+        # name+shape weight inheritance (teacher / best-student) stays exact. Identity
+        # passes both Tensor and List[Tensor] inputs through, matching a block's
+        # call signature in the sequential loop. Dropped blocks contribute no params.
+        for i in self.drop_block_indices:
+            self.backbone.blocks[i] = nn.Identity()
+
+        self.dim_features = next(b.attn.qkv.in_features for b in self.backbone.blocks
+                                 if not isinstance(b, nn.Identity))
         self.num_features = intermediate_layers if isinstance(intermediate_layers, int) else len(intermediate_layers)
 
         if img_mask_ratio > 0:
@@ -85,11 +95,13 @@ class DINOv2_RGBD_Encoder(nn.Module):
 
     def enable_gradient_checkpointing(self):
         for i in range(len(self.backbone.blocks)):
-            wrap_module_with_gradient_checkpointing(self.backbone.blocks[i])
+            if not isinstance(self.backbone.blocks[i], nn.Identity):
+                wrap_module_with_gradient_checkpointing(self.backbone.blocks[i])
 
     def enable_pytorch_native_sdpa(self):
         for i in range(len(self.backbone.blocks)):
-            wrap_dinov2_attention_with_sdpa(self.backbone.blocks[i].attn)
+            if not isinstance(self.backbone.blocks[i], nn.Identity):
+                wrap_dinov2_attention_with_sdpa(self.backbone.blocks[i].attn)
 
     def forward(self, 
                 image: torch.Tensor, 
