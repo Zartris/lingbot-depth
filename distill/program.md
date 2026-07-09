@@ -227,3 +227,17 @@ the raw data, this is the interpretation — especially "budget-limited, needs p
   (GPU contention/thermal during that session). Lesson: treat single-run latency swings
   with suspicion; re-benchmark interleaved before believing a big latency delta. Its
   score 420.97 is latency-inflated but its accuracy row is valid (mean_absrel 0.0394 ≈ teacher).
+- 2026-07-09 run 20260709-082229 (seed UNCHANGED, 90 min): REJECTED — training DEGRADES the
+  teacher-init seed (absrel_w 0.039 → 0.313 at every level; subset sim 0.006→0.17, real
+  0.08→0.40 → GLOBAL drift, not real-overfit). Train loss itself rose from 0.23 at init to
+  ~0.4-1.0 and never recovered; at init the gt loss (0.19) dominates feat (0.002) + out (0.04),
+  and only ~330 steps fit in 90 min (~16 s/step, batch 2). Conclusion: the "gentle" recipe is
+  NOT gentle enough for a converged init over 90 min (constant-LR AdamW noise-ball + conflicting
+  gt gradient). Recipe must first PRESERVE the seed before any shrink is testable. → diagnostic
+  sweep: V1 W_GT=0 vs V2 LR 1e-5+cosine→0 (25 min each, subset eval), winner becomes the
+  official recipe iteration.
+- 2026-07-09 diagnostic sweep VERDICT (25-min trains, 60-sample L6 subset, teacher ref
+  weighted 0.0591): V1 (W_GT=0, const LR 5e-5) collapsed like the control → GT loss NOT the
+  culprit. V2 (LR 1e-5 + cosine→1e-6, W_GT on) PRESERVED the seed: weighted 0.0603
+  (real 0.0816 = teacher's 0.0817, sim 0.0106 vs 0.0062). Root cause: constant-LR AdamW
+  noise-ball drift on a converged init. train.py now defaults LR=1e-5 + cosine.

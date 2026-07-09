@@ -93,7 +93,19 @@ BUDGET_MINUTES = None      # None -> prepare.TRAIN_MINUTES; else minutes for THI
 # optimum, so fine-tune GENTLY: AdamW takes ~full-LR steps even at near-zero loss, so a
 # high LR / high weight-decay walks a good init straight off its optimum (observed: a
 # teacher-perfect seed collapsed in ~9 steps at LR 2e-4). Low LR + warmup + low WD.
-LR = 5e-5                  # peak LR (fine-tuning, not from-scratch)
+# WHY LR 1e-5 + cosine (changed 2026-07-09): the previous LR 5e-5 CONSTANT destroyed the
+# teacher-init seed in <100 post-warmup steps (90-min run: absrel 0.039 -> 0.313, train
+# loss ROSE 0.23 -> ~0.5 and never recovered; both sim and real degraded => global
+# optimizer drift, not data overfit). A/B diagnostic: W_GT=0 at const 5e-5 still
+# collapsed (weighted 0.354), while LR 1e-5 + cosine->1e-6 PRESERVED the seed
+# (weighted 0.060 vs teacher 0.059 on the same subset). A converged init sits in an
+# AdamW noise ball of radius ~ LR x grad-noise; constant LR keeps it walking away,
+# cosine decay collapses the ball so the student ends AT the optimum.
+LR = 1e-5                  # peak LR (fine-tuning a converged init — keep small)
+LR_SCHEDULE = "cosine"     # "const" | "cosine": cosine decays LR -> LR_MIN over the TIME
+                           # budget (elapsed/budget), so a converged init ends in a shrinking
+                           # noise ball instead of random-walking at constant LR forever.
+LR_MIN = 1e-6              # floor of the cosine decay
 WARMUP_STEPS = 100         # linear LR warmup from 0 -> LR (lets Adam's variance settle)
 WEIGHT_DECAY = 0.01        # low: high WD pulls inherited weights toward 0 (destructive)
 BATCH_SIZE = 2
@@ -281,6 +293,7 @@ def _experiment_fingerprint(student_cfg: dict) -> str:
         "backbone": STUDENT_BACKBONE, "cfg": student_cfg,
         "w_out": W_OUTPUT_DISTILL, "w_feat": W_FEATURE_DISTILL, "w_gt": W_GT,
         "tokens": FEATURE_TOKENS, "lr": LR, "warmup": WARMUP_STEPS,
+        "sched": LR_SCHEDULE, "lr_min": LR_MIN,
         "wd": WEIGHT_DECAY, "bs": BATCH_SIZE, "warm_start": WARM_START_FROM,
     }, sort_keys=True, default=str)
     return hashlib.sha256(key.encode()).hexdigest()[:16]
@@ -394,7 +407,12 @@ def main(run_dir: Path, use_hf: bool = False,
         idx = rng.integers(0, n, size=BATCH_SIZE)
         samples = [train_set[int(i)] for i in idx]
         losses = distill_step(student, teacher, samples, dev, feat_proj=feat_proj)
-        lr_now = LR * min(1.0, (step + 1) / max(1, WARMUP_STEPS))   # linear warmup
+        if LR_SCHEDULE == "cosine":   # decay over the TIME budget (resume-consistent)
+            frac = min(1.0, elapsed() / (budget_min * 60.0))
+            lr_base = LR_MIN + (LR - LR_MIN) * 0.5 * (1.0 + np.cos(np.pi * frac))
+        else:
+            lr_base = LR
+        lr_now = lr_base * min(1.0, (step + 1) / max(1, WARMUP_STEPS))   # linear warmup
         for g in opt.param_groups:
             g["lr"] = lr_now
         opt.zero_grad(set_to_none=True)
