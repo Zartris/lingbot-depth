@@ -114,6 +114,16 @@ INHERIT_TEACHER = True     # copy ALL matching teacher weights (encoder + decode
 # isolated test when that matters.
 WARM_START_FROM = "best"
 
+# --- crash/interrupt resilience ---------------------------------------------- #
+# The training loop periodically saves an "inflight" checkpoint (model + optimizer +
+# step + elapsed time + RNG states) so an interrupted experiment RESUMES instead of
+# restarting: the budget clock continues from where it stopped. The checkpoint is
+# keyed by a fingerprint of the experiment (architecture + recipe); a different
+# experiment ignores a stale inflight file and overwrites it on its first save.
+# On successful completion the inflight file is deleted.
+CHECKPOINT_EVERY_SEC = 300     # save every 5 min -> at most ~5 min of work lost
+INFLIGHT_CKPT = prepare.RUNS_DIR / "inflight.pt"
+
 # NOTE: the training data pool, the eval set, and the compute budget
 # (TRAIN_MINUTES / MAX_STEPS) are FROZEN in distill/prepare.py — not here — so every
 # experiment runs on equal data at equal compute and the agent can't change its own
@@ -259,6 +269,70 @@ def distill_step(student, teacher, samples, dev, feat_proj=None) -> Dict[str, to
 
 
 # --------------------------------------------------------------------------- #
+#  Checkpoint / resume                                                          #
+# --------------------------------------------------------------------------- #
+
+def _experiment_fingerprint(student_cfg: dict) -> str:
+    """Identity of the experiment an inflight checkpoint belongs to. Same fingerprint
+    -> resuming continues the SAME experiment; anything else starts fresh. Budget is
+    deliberately excluded so a resume may extend/shorten the remaining time."""
+    import hashlib, json
+    key = json.dumps({
+        "backbone": STUDENT_BACKBONE, "cfg": student_cfg,
+        "w_out": W_OUTPUT_DISTILL, "w_feat": W_FEATURE_DISTILL, "w_gt": W_GT,
+        "tokens": FEATURE_TOKENS, "lr": LR, "warmup": WARMUP_STEPS,
+        "wd": WEIGHT_DECAY, "bs": BATCH_SIZE, "warm_start": WARM_START_FROM,
+    }, sort_keys=True, default=str)
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+def _save_inflight(fp: str, student, opt, feat_proj, step: int, elapsed_sec: float, rng) -> None:
+    """Atomic periodic save of everything needed to continue training."""
+    tmp = INFLIGHT_CKPT.with_suffix(".tmp")
+    torch.save({
+        "fingerprint": fp,
+        "model": student.state_dict(),
+        "opt": opt.state_dict(),
+        "feat_proj": feat_proj.state_dict() if feat_proj is not None else None,
+        "step": step,
+        "elapsed_sec": elapsed_sec,
+        "np_rng_state": rng.bit_generator.state,
+        "torch_rng_state": torch.get_rng_state(),
+        "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }, tmp)
+    tmp.replace(INFLIGHT_CKPT)
+
+
+def _try_resume(fp: str, student, opt, feat_proj, rng) -> "tuple[int, float]":
+    """If a matching inflight checkpoint exists, restore it and return
+    (start_step, already_elapsed_sec); otherwise (0, 0.0)."""
+    if not INFLIGHT_CKPT.exists():
+        return 0, 0.0
+    try:
+        ck = torch.load(INFLIGHT_CKPT, map_location="cpu", weights_only=False)
+    except Exception as e:
+        print(f"[train] inflight checkpoint unreadable ({e}) — starting fresh")
+        return 0, 0.0
+    if ck.get("fingerprint") != fp:
+        print("[train] inflight checkpoint is from a DIFFERENT experiment — starting fresh")
+        return 0, 0.0
+    student.load_state_dict(ck["model"])
+    opt.load_state_dict(ck["opt"])
+    if feat_proj is not None and ck.get("feat_proj") is not None:
+        feat_proj.load_state_dict(ck["feat_proj"])
+    rng.bit_generator.state = ck["np_rng_state"]
+    torch.set_rng_state(ck["torch_rng_state"])
+    if ck.get("cuda_rng_state") is not None and torch.cuda.is_available():
+        try:
+            torch.cuda.set_rng_state_all(ck["cuda_rng_state"])
+        except Exception:
+            pass   # GPU count changed; sample order (np rng) is what matters
+    print(f"[train] RESUMED from inflight checkpoint: step={ck['step']}, "
+          f"{ck['elapsed_sec']/60:.1f} min already spent")
+    return int(ck["step"]), float(ck["elapsed_sec"])
+
+
+# --------------------------------------------------------------------------- #
 #  Train                                                                        #
 # --------------------------------------------------------------------------- #
 
@@ -305,9 +379,18 @@ def main(run_dir: Path, use_hf: bool = False,
     opt = torch.optim.AdamW(params, lr=LR, weight_decay=WEIGHT_DECAY)
 
     rng = np.random.default_rng(prepare.SEED)
+
+    # Resume an interrupted run of THIS experiment, if an inflight checkpoint matches.
+    fp = _experiment_fingerprint(student_cfg)
+    step, elapsed_prior = _try_resume(fp, student, opt, feat_proj, rng)
+
     t_start = time.time()
-    step = 0
-    while (time.time() - t_start) < budget_min * 60 and step < budget_steps:
+    last_ckpt = time.time()
+
+    def elapsed() -> float:
+        return elapsed_prior + (time.time() - t_start)
+
+    while elapsed() < budget_min * 60 and step < budget_steps:
         idx = rng.integers(0, n, size=BATCH_SIZE)
         samples = [train_set[int(i)] for i in idx]
         losses = distill_step(student, teacher, samples, dev, feat_proj=feat_proj)
@@ -320,8 +403,12 @@ def main(run_dir: Path, use_hf: bool = False,
         opt.step()
         if step % 20 == 0:
             msg = " ".join(f"{k}={v.item():.4f}" for k, v in losses.items())
-            print(f"[train] step {step:5d} t={time.time()-t_start:6.1f}s {msg}")
+            print(f"[train] step {step:5d} t={elapsed():6.1f}s {msg}")
         step += 1
+        if time.time() - last_ckpt >= CHECKPOINT_EVERY_SEC:
+            _save_inflight(fp, student, opt, feat_proj, step, elapsed(), rng)
+            last_ckpt = time.time()
+            print(f"[train] inflight checkpoint saved at step {step} ({elapsed()/60:.1f} min)")
 
     run_dir.mkdir(parents=True, exist_ok=True)
     snapshot_pkg = _snapshot_student_code(run_dir)   # freeze the student CODE with the weights
@@ -335,6 +422,7 @@ def main(run_dir: Path, use_hf: bool = False,
         "steps": step,
     }, ckpt_path)
     print(f"[train] done: {step} steps, saved {ckpt_path} (+ code snapshot {snapshot_pkg}/)")
+    INFLIGHT_CKPT.unlink(missing_ok=True)   # completed — the inflight checkpoint is stale
     return ckpt_path
 
 
